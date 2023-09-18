@@ -1,3 +1,6 @@
+from numpy.linalg import lstsq
+
+
 class Machine:
     def __init__(self, name="Machine"):
         self.name = name
@@ -51,11 +54,56 @@ class Recipe:
         return str(self)
 
 class Group:
-    def __init__(self):
-        ...
+    def __init__(self, steps=None):
+        self.steps = steps if steps else []
 
     def __repr__(self):
         return str(self)
+
+    """def neighbourhood(self):
+        neighs = set()
+
+        for step in self.steps:
+            for targets in step.pull.values():
+                for target in targets:
+                    neighs.add(target)
+
+        return neighs.difference(self.steps)"""
+
+    def junction(self, start, push, tag):
+        # a junction identifies a cluster of nodes all sharing the resource `tag`
+        junction = set([start])
+        q = [(start, push)]
+        
+        while q:
+            node, push = q.pop()
+
+            opposites = node.push if push else node.pull
+
+            for opp in opposites[tag]:
+                if opp not in junction:
+                    q.append((opp, not push))
+                    junction.add(opp)
+        
+    def matrix(self):
+        # the matrix of a group represents the total flow of a group
+        # given an input vector of rates.
+        # internal flows should add up to zero,
+        # external flows can be varied.
+        
+        A = {}
+
+        variables = []
+        results   = []
+
+        junctions = {}
+        j = 0
+
+        for step in self.steps:
+            variables.append(step)
+            ...
+            
+            
 
 class Step:
     index = 0
