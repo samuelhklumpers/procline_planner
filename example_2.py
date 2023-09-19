@@ -1,8 +1,8 @@
 from throughput import *
 
+step0 = Step()
 step1 = Step()
 step2 = Step()
-step3 = Step()
 AE = Buffer("AE")
 
 LCR = Machine("LCR")
@@ -14,49 +14,62 @@ Na    = Item(4)
 SSi   = Item(5)
 NaCl  = Item(6)
 
-Si_SiCl4 = Recipe({Si : Qty(1), Cl : Qty(4000),
-                   SiCl4 : Qty(-1000)},
+Si_SiCl4 = Recipe({Si : Qty(1), Cl : Qty(4000)},
+                  {SiCl4 : Qty(-1000)},
                   duration = {LCR : 1},
                   power    = {LCR : 1})
 
-SiCl4_SSi = Recipe({SiCl4 : Qty(1000), Na : Qty(4),
-                    SSi : Qty(-1), NaCl : Qty(-8)},
+SiCl4_SSi = Recipe({SiCl4 : Qty(1000), Na : Qty(4)},
+                   {SSi : Qty(-1), NaCl : Qty(-8)},
                    duration = {LCR : 1},
                    power    = {LCR : 1})
 
-NaCl_Cl = Recipe({NaCl : Qty(2),
-                  Na : Qty(-1), Cl : Qty(-1000)},
-                   duration = {LCR : 1},
-                   power    = {LCR : 1})
+NaCl_Cl = Recipe({NaCl : Qty(2)},
+                 {Na : Qty(-1), Cl : Qty(-1000)},
+                  duration = {LCR : 1},
+                  power    = {LCR : 1})
+
+step0.machine = LCR
+step0.recipe  = Si_SiCl4
 
 step1.machine = LCR
-step1.recipe  = Si_SiCl4
+step1.recipe  = SiCl4_SSi
 
 step2.machine = LCR
-step2.recipe  = SiCl4_SSi
+step2.recipe  = NaCl_Cl
 
-step3.machine = LCR
-step3.recipe  = NaCl_Cl
+step0.pull[Si]    = [AE]
+step0.pull[Cl]    = [step2]
+step0.push[SiCl4] = [step1]
 
-step1.pull[Si]    = [AE]
-step1.pull[Cl]    = [step3]
-step1.push[SiCl4] = [step2]
+step1.pull[SiCl4] = [step0]
+step1.pull[Na]    = [step2]
+step1.push[SSi]   = [AE]
+step1.push[NaCl]  = [step2]
 
-step2.pull[SiCl4] = [step1]
-step2.pull[Na]    = [step3]
-step2.push[SSi]   = [AE]
-step2.push[NaCl]  = [step3]
+step2.pull[NaCl]  = [step1]
+step2.push[Na]    = [step1]
+step2.push[Cl]    = [step0]
 
-step3.pull[NaCl]  = [step2]
-step3.push[Na]    = [step2]
-step3.push[Cl]    = [step1]
-
-AE.push[Si] = [step1]
-AE.pull[Cl] = [step3]
+AE.push[Si] = [step0]
+AE.pull[SSi] = [step1]
 
 from tscca import tarjan
 
-nodes = [step1, step2, step3, AE]
+nodes = [step0, step1, step2, AE]
 sccs = tarjan(nodes)
 
-print(sccs)
+make_groups(nodes, sccs)
+
+step1.propagate_item(SSi, AE, 1)
+
+
+#print(sccs)
+
+#group1 = Group(sccs[0])
+#mat, x, y, buffs = group1.matrix()
+
+#print(mat)
+#print(x)
+#print(y)
+#print(buffs)
