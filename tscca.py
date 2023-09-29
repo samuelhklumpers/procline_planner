@@ -12,6 +12,7 @@ def tarjan(nodes):
     sccs  = []
 
     def strongconnect(v, cause=None, push=False):
+        # print("s", v, cause, push)
         # cause: the node v is being strongconnected from
         # push: true if v is being strongconnected from cause.push,
         # false if from cause.pull
@@ -42,7 +43,11 @@ def tarjan(nodes):
             else:
                 suc_push.remove(cause)
 
+        # print(suc_pull)
+        # print(suc_push)
+
         def step(w, push):
+            # print("step", w, push)
             if w not in indices:
                 # Successor w has not yet been visited; recurse on it
                 strongconnect(w, v, push)
@@ -57,7 +62,7 @@ def tarjan(nodes):
         for w in suc_pull:
             step(w, False)
 
-        for w in suc_pull:
+        for w in suc_push:
             step(w, True)
 
         # If v is a root node, pop the stack and generate an SCC
