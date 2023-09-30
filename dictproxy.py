@@ -32,6 +32,15 @@ class ListProxy(object):
     def __getitem__(self, key):
         return wrap(self.obj[key])
 
+    def __getattr__(self, key):
+        try:
+            return getattr(self.obj, key)
+        except AttributeError:
+            try:
+                return self[key]
+            except KeyError as exc:
+                raise AttributeError(key) from exc
+
     def unwrap(self):
         return self.obj
 

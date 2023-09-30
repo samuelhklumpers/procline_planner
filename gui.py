@@ -7,15 +7,16 @@ import pickle
 
 from typing import Dict, Generic, List, Optional, Union, Tuple, TypeVar
 from enum import IntFlag, auto
-from functools import partial
 
 from ttkwidgets.autocomplete import AutocompleteEntry
 import tkinter.simpledialog
 
-from dictproxy import wrap
-from throughput import Buffer, Machine, Step, make_groups
-from tscca import tarjan
+from dictproxy import DictProxy, wrap
+from throughput import Buffer, Recipe, Step, make_groups
+from tscca import circuits
 
+
+SAVE_FN = "procline.json"
 
 class TkMods(IntFlag):
     SHIFT = 0x1
@@ -128,9 +129,8 @@ class NodeMenu(tk.Menu):
         tk.Menu.__init__(self, master, tearoff=False)
         self.master: NodeCanvas
 
-        self.node: Optional["NodeFrame"] = None
-        self.add_command(label="Propagate from here", command=partial(self.master.propagate_flow, self.node))
-
+        self.node: Optional["StepFrame"] = None
+        self.add_command(label="Propagate from here", command=lambda: self.master.propagate_flow(self.node))
         self.add_command(label="Delete", command=lambda: (self.node.delete() if self.node is not None else None))
 
 # class JSON(ABC):
@@ -174,7 +174,7 @@ class NodeCanvas(tk.Canvas):
         self.root = master
         self.menubar = NodeToolbar(self)
 
-        self.autosave = "procline2.json"
+        self.autosave = SAVE_FN
         self.recipes_by_machine = {}
         self.nodes: List[NodeFrame] = []
         # self.sccs: List[Group] = []
@@ -205,7 +205,7 @@ class NodeCanvas(tk.Canvas):
             self.bind(e, lambda e: self.gesture_manager.on_event(e, self))
 
         self.bind("<Delete>", lambda e: self.delete_selection())
-        self.bind("<Visibility>", self.decode)
+        self.after(500, self.decode)
 
         self.focus_set()
 
@@ -216,14 +216,15 @@ class NodeCanvas(tk.Canvas):
 
         nodes = [node.model for node in self.nodes]
 
-        make_groups(nodes, tarjan(nodes))
+        make_groups(nodes, circuits(nodes))
 
-        for node in self.nodes:
-            if isinstance(node.model, Step):
-                print(node, node.model.group, node.model.pull, node.model.push)
+        # for node in self.nodes:
+        #     if isinstance(node.model, Step):
+        #         print(node, node.model.group, node.model.pull, node.model.push)
 
     def propagate_flow(self, node: Optional["StepFrame"]):
         self.reconstruct()
+        self.run_sccs()
 
         if node is None:
             raise RuntimeError("?")
@@ -231,6 +232,13 @@ class NodeCanvas(tk.Canvas):
         # TODO low: report total failure
         
         node.propagate_flow()
+
+        for step in self.nodes:
+            if isinstance(step, StepFrame):
+                if step.model is None:
+                    raise RuntimeError("Impossible")
+                else:
+                    step.rate.set(step.model.rate)
 
     def reconstruct(self):
         for node in self.nodes:
@@ -254,11 +262,11 @@ class NodeCanvas(tk.Canvas):
 
         return {"canvas": d}
 
-    def decode(self, _):
+    def decode(self, _=None):
         self.unbind("<Visibility>")
 
         try:
-            with open("procline2.json", mode="r", encoding="utf-8") as fp:
+            with open(SAVE_FN, mode="r", encoding="utf-8") as fp:
                 d = json.load(fp) 
                 d = d["canvas"]
 
@@ -310,39 +318,57 @@ class NodeCanvas(tk.Canvas):
                 for item in recipe.fO:
                     by_output.setdefault(item.uN, []).append(recipe)
 
-        if os.path.exists("items.pickle"):
+        try:
             with open("items.pickle", mode="rb") as fp:
-                self.itemlist = wrap(pickle.load(fp))
-        else:
+                self.itemlist, self.id_to_item = wrap(pickle.load(fp))
+        except (OSError, KeyError, ValueError, TypeError):
             items = {}
+            id_to_item = {}
 
             for _, recipes in self.recipes_by_machine.items():
                 for recipe in recipes:
                     for item in recipe.iI:
                         ids = items.setdefault(item.lN, [])
+                        id_to_item.setdefault(item.uN, item.lN)
                         if item.uN not in ids:
                             ids.append(item.uN)
 
                     for item in recipe.iO:
                         ids = items.setdefault(item.lN, [])
+                        id_to_item.setdefault(item.uN, item.lN)
                         if item.uN not in ids:
                             ids.append(item.uN)
 
                     for item in recipe.fI:
                         ids = items.setdefault(item.lN, [])
+                        id_to_item.setdefault(item.uN, item.lN)
                         if item.uN not in ids:
                             ids.append(item.uN)
 
                     for item in recipe.fO:
                         ids = items.setdefault(item.lN, [])
+                        id_to_item.setdefault(item.uN, item.lN)
                         if item.uN not in ids:
                             ids.append(item.uN)
 
-            self.itemlist = wrap(items)
+            self.id_to_item = id_to_item
+            self.itemlist   = wrap(items)
 
             with open("items.pickle", mode="wb") as fp:
-                pickle.dump(items, fp)
+                pickle.dump((items, id_to_item), fp)
+
+        self.itemlist[""]   = "null"
+        self.id_to_item[""] = ""
     
+    def item_name(self, item_id):
+        return self.id_to_item[item_id]
+
+    def recipe_id(self, machine, recipe):
+        return self.recipes_by_machine[machine].index(recipe)
+    
+    def recipe_by_id(self, machine, recipe_id):
+        return self.recipes_by_machine[machine][recipe_id]
+
     def search_recipe(self, machine: str, inputs: List[str], outputs: List[str]):
         # TODO low: fast(er?) recipe search
         if inputs:
@@ -413,7 +439,7 @@ class NodeCanvas(tk.Canvas):
                     self.toggle_connect(self.hatch, source)
                     self.hatch = None
         elif mod == Gesture.CLICK | Gesture.RIGHT:
-            if isinstance(source, NodeFrame):
+            if isinstance(source, StepFrame):
                 self.node_menu.tk_popup(x, y, 0)
                 self.node_menu.node = source
             else:
@@ -595,6 +621,8 @@ class NodeCanvas(tk.Canvas):
             dx = self.winfo_rootx()
             dy = self.winfo_rootx()
 
+            # print(dx, dy)
+
             conn = Connection(self, self.create_line(x1 - dx, y1 - dy, x2 - dx, y2 - dy, fill="#00FF00", width=3))
 
             self.connections.setdefault(a, {})[b] = conn
@@ -606,8 +634,8 @@ class NodeCanvas(tk.Canvas):
             del self.connections[a][b]
             del self.connections[b][a]
             
-            a.disconnect(b)
-            b.disconnect(a)
+            a._disconnect(b)
+            b._disconnect(a)
 
     def toggle_connect(self, a: "Hatch", b: "Hatch"):
         if a.is_input != b.is_input:
@@ -631,7 +659,7 @@ class Connection:
 
 
 class Hatch(tk.Frame):
-    def __init__(self, master: "HatchBar", is_input: bool, *args, **kwargs):
+    def __init__(self, master: "HatchBar", is_input: bool, item_id=None, *args, **kwargs):
         tk.Frame.__init__(self, master, *args, **kwargs)
         self.master: "HatchBar"
 
@@ -643,6 +671,9 @@ class Hatch(tk.Frame):
         self.node: NodeFrame = master.master
         self.item_name = ""
         self.item_id   = ""
+
+        if item_id is not None:
+            self.set_item(item_id)
 
         self.is_input = is_input
         self.connections: List[Hatch] = []
@@ -659,9 +690,7 @@ class Hatch(tk.Frame):
         self.bind("<Delete>", lambda e: self.master.remove_hatch(self))
 
     def remove(self):
-        for conn in list(self.connections):
-            self.master.master.master.disconnect(self, conn)
-
+        self.disconnect_all()
         self.destroy()
 
     def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
@@ -671,11 +700,12 @@ class Hatch(tk.Frame):
 
     def decode(self, d):
         self.d_connections = d["connections"]
-        self.set_item(d["id"], d.get("name", ""))
+        self.set_item(d["id"])
     
-    def set_item(self, item_id, item_name):
+    def set_item(self, item_id):
+        # , item_name):
         self.item_id = item_id
-        self.item_name = item_name
+        self.item_name = self.master.master.master.item_name(item_id)
         self.description.set(self.item_name)
 
     def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
@@ -694,30 +724,37 @@ class Hatch(tk.Frame):
         # TODO low: prevent mismatched hatch connections
         
         if bool(self.item_name) > bool(target.item_name):
-            target.set_item(self.item_id, self.item_name)
+            target.set_item(self.item_id)
 
         if bool(self.item_name) < bool(target.item_name):
-            self.set_item(target.item_id, target.item_name)
+            self.set_item(target.item_id)
 
         if target not in self.connections:
             self.connections.append(target)
 
-    def disconnect(self, target: "Hatch"):
+    def _disconnect(self, target: "Hatch"):
         if target in self.connections:
             self.connections.remove(target)
 
+    def disconnect_all(self):
+        for conn in self.connections:
+            self.master.master.master.disconnect(self, conn)
+
     def item_menu(self):
         item_name = tkinter.simpledialog.askstring("Item name?", "Item name?", initialvalue=self.item_name)
-
         item_id = ""
+
+        if item_name is None:
+            return
+
         try:
             item_id = self.master.master.master.itemlist[item_name][0] # TODO low: lol
+            self.set_item(item_id) # bit inefficient but ok
         except:
             print("Warning:", item_name, "is an invalid item name")
 
-        self.set_item(item_id, item_name if item_name else "")
-
-        # TODO mid: partially invalidate connection
+        if item_id != self.item_id:
+            self.disconnect_all()
 
 
 class HatchBar(tk.Frame):
@@ -749,13 +786,21 @@ class HatchBar(tk.Frame):
 
         return self
 
+    def disconnect_all(self):
+        for hatch in self.hatches:
+            hatch.disconnect_all()
+
+    def remove_all(self):
+        for hatch in list(self.hatches):
+            self.remove_hatch(hatch)
+
     def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
         for hatch in self.hatches:
             hatch.tie(canvas, nodes)
 
-    def add_hatch(self):
+    def add_hatch(self, item_id=None):
         # TODO low: adding hatches should move connections on the canvas
-        self.hatches.append(Hatch(self, self.is_input, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1))
+        self.hatches.append(Hatch(self, self.is_input, item_id=item_id, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1))
         self.space()
 
     def insert_hatch(self, i, hatch):
@@ -763,6 +808,7 @@ class HatchBar(tk.Frame):
         self.space()
 
     def remove_hatch(self, hatch):
+        self.master.master.hatch = None # just in case
         self.hatches.remove(hatch)
         hatch.remove()
         self.space()
@@ -804,6 +850,7 @@ class NodeFrame(tk.Frame, ABC):
         self.configure(background="#FFFFFF", highlightbackground="#000000", highlightcolor="#0000FF", highlightthickness=1)
     
         self.bind("<Delete>", lambda e: self.master.delete_selection())
+        # self.bind("x", lambda e: print(self.winfo_rootx(), self.winfo_rooty(), self.master.winfo_rootx(), self.master.winfo_rooty()))
 
     # TODO low: disconnect all button
 
@@ -844,11 +891,11 @@ class NodeFrame(tk.Frame, ABC):
         # TODO low: validate
         for hatch in self.input_hatches.hatches:
             for conn in hatch.connections:
-                self.model.pull.setdefault(hatch.item_id, []).append(conn.node.model)
+                self.model.pull.setdefault(hatch.item_id, []).append(conn.node.model) # type: ignore
 
         for hatch in self.output_hatches.hatches:
             for conn in hatch.connections:
-                self.model.push.setdefault(hatch.item_id, []).append(conn.node.model)
+                self.model.push.setdefault(hatch.item_id, []).append(conn.node.model) # type: ignore
 
     def tie(self, nodes: List["NodeFrame"]):
         self.input_hatches.tie(self.master, nodes)
@@ -865,12 +912,7 @@ class NodeFrame(tk.Frame, ABC):
 
 
 def recipe_str(recipe):
-    # TODO low: maybe scientific
-    x = " + ".join(str(qty['a']) + " * " + qty['lN'] for qty in recipe.iI.unwrap() + recipe.fI.unwrap())
-    x += " -> " 
-    x += " + ".join(str(qty['a']) + " * " + qty['lN'] for qty in recipe.iO.unwrap() + recipe.fO.unwrap())
-
-    return x
+    return str(Recipe(recipe))
 
 def ask_multiple_choice_question(master, prompt, options):
     root = tk.Toplevel(master)
@@ -883,18 +925,22 @@ def ask_multiple_choice_question(master, prompt, options):
     for i, option in enumerate(options):
         tk.Radiobutton(root, text=recipe_str(option), variable=v, value=i).pack(anchor="w")
 
-    tk.Button(root, text="Ok?", command=root.destroy).pack()
+    is_ok = [False]
+    def ok():
+        is_ok[0] = True
+        root.destroy()
+
+    tk.Button(root, text="Ok?", command=ok).pack()
 
     root.update_idletasks()
     root.geometry("")
 
+    root.focus()
     root.grab_set()
     root.wait_window()
 
-    if v.get() == 0:
-        return None
-    
-    return options[v.get()]
+    if is_ok[0]:
+        return options[v.get()]
 
 
 class StepFrame(NodeFrame):
@@ -909,12 +955,13 @@ class StepFrame(NodeFrame):
         self.grid_rowconfigure(index=1, weight=4)
         self.machine = tk.StringVar()
         self.recipe_name = tk.StringVar()
-        self.recipe = None
+        self.recipe: Optional[DictProxy] = None
+        self.recipe_id: Optional[int] = None
         self.rate   = tk.DoubleVar()
 
-        # TODO high: changing the machine invalidates the recipe
-        # TODO high: changing the recipe partially invalidates the hatches
-        self.machinebox = AutocompleteEntry(self.settings, completevalues=list(master.recipes_by_machine.keys()), textvariable=self.machine)
+        invalidate_machine = self.register(self.invalidate_machine)
+
+        self.machinebox = AutocompleteEntry(self.settings, completevalues=list(master.recipes_by_machine.keys()), textvariable=self.machine, validatecommand=(invalidate_machine,))
         self.recipebox  = tk.Label(self.settings, textvariable=self.recipe_name)
         self.recipebox.configure(background="white", borderwidth=2, relief="groove")
         self.ratebox    = tk.Entry(self.settings, textvariable=self.rate)
@@ -927,14 +974,68 @@ class StepFrame(NodeFrame):
         self.settings.grid_rowconfigure(2, weight=1)
         self.settings.grid_columnconfigure(0, weight=1)
         
+        self.bind("<Control-r>", lambda _: self.refine())
         self.recipebox.bind("<Button-1>", lambda _: self.select_recipe())
 
         for e in MOUSE_EVENTS:
             self.settings.bind(e, lambda e: self.master.gesture_manager.on_event(e, self))
 
-    def set_recipe(self, recipe):
-        self.recipe = recipe
-        self.recipe_name.set(recipe_str(self.recipe))
+    def refine(self):
+        x, y = self.winfo_x(), self.winfo_y()
+
+        if self.recipe is not None:
+            for n, hatch in enumerate(self.input_hatches.hatches):
+                if not hatch.connections:
+                    self.master.new_node(x - 100 + 50 * n, y - 300)
+
+            for n, hatch in enumerate(self.output_hatches.hatches):
+                if not hatch.connections:
+                    self.master.new_node(x - 100 + 50 * n, y + 300)
+
+    def invalidate_machine(self):
+        # print("Invalidate!")
+
+        self.recipe = None
+        self.recipe_id = None
+        self.recipe_name.set("")
+        self.invalidate_recipe()
+
+    def invalidate_recipe(self):
+        self.remove_all()
+
+        if self.recipe is not None:
+            recipe = Recipe(self.recipe)
+
+            # print(recipe)
+
+            for item in recipe.consume:
+                self.input_hatches.add_hatch(item)
+
+            for item in recipe.produce:
+                self.output_hatches.add_hatch(item)
+
+    def disconnect_all(self):
+        self.input_hatches.disconnect_all()
+        self.output_hatches.disconnect_all()
+
+    def remove_all(self):
+        self.input_hatches.remove_all()
+        self.output_hatches.remove_all()
+
+    def set_recipe(self, recipe=None, recipe_id=None):
+        if recipe:
+            self.recipe = recipe
+            recipe_id = self.master.recipe_id(self.machine.get(), recipe.unwrap())
+            self.recipe_name.set(recipe_str(self.recipe))
+
+            if True: # recipe_id != self.recipe_id:
+                self.invalidate_recipe()
+
+            self.recipe_id = recipe_id
+        elif recipe_id:
+            self.recipe = self.master.recipe_by_id(self.machine.get(), recipe_id)
+            self.recipe_id = recipe_id
+            self.recipe_name.set(recipe_str(self.recipe))
 
     def select_recipe(self):
         # TODO low: validate
@@ -943,18 +1044,17 @@ class StepFrame(NodeFrame):
             outputs = [hatch.item_id for hatch in self.output_hatches.hatches if hatch.item_id]
 
             recipes = self.master.search_recipe(self.machine.get(), inputs, outputs)
-            # TODO high: ! clicking the recipe lists the valid recipes for this hatch configuration
 
             if len(recipes) == 1:
-                # :)
                 self.set_recipe(recipes[0])
             elif len(recipes) > 1:
                 recipe = ask_multiple_choice_question(self, "Recipe?", recipes)
-                
+                # print(recipe)
+
                 if recipe is not None:
                     self.set_recipe(recipe)
             else:
-                ... # :(
+                print("No valid recipe found :(")
 
     def propagate_flow(self):
         if self.model is not None:
@@ -965,7 +1065,7 @@ class StepFrame(NodeFrame):
         return { "type": "step"
                , "pos": (self.winfo_x(), self.winfo_y())
                , "machine": self.machine.get()
-               , "recipe": self.recipe_name.get()
+               , "recipe": self.recipe_id
                , "rate": self.rate.get()
                , "inputs": self.input_hatches.encode(hatch_tl)
                , "outputs": self.output_hatches.encode(hatch_tl)}
@@ -975,14 +1075,21 @@ class StepFrame(NodeFrame):
         self.place(x=x, y=y)
 
         self.machine.set(d.get("machine", ""))
-        self.recipe_name.set(d.get("recipe", ""))
+        self.recipe_id = d.get("recipe")
+
+        if self.recipe_id is not None:
+            self.set_recipe(recipe_id=self.recipe_id)
+
         self.rate.set(d.get("rate", ""))
 
         self.input_hatches.decode(d.get("inputs", []))
         self.output_hatches.decode(d.get("outputs", []))
 
     def reconstruct(self):
-        self.model = Step(self.machine.get(), self.recipe)
+        if self.recipe is None:
+            raise RuntimeError("Can't reconstruct when recipe is unspecified")
+        else:
+            self.model = Step(self.recipe)
 
 
 class BufferFrame(NodeFrame):

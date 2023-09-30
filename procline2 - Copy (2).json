@@ -1,1 +1,0 @@
-{"canvas": [{"pos": [324, 220], "machine": "Large Chemical Reactor", "recipe": "", "rate": 0.0, "inputs": [], "outputs": [[[1, false, 0]]]}, {"pos": [433, 516], "machine": "Large Chemical Reactor", "recipe": "", "rate": 1.0, "inputs": [[[0, true, 0]], []], "outputs": []}]}
