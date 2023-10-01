@@ -115,6 +115,24 @@ class GestureManager():
 
         self.canvas.gesture(x, y, xint, yint, mod, source)
 
+
+class Position(tk.Misc):
+    def __init__(self, parent: Optional["Position"]):
+        self.parent = parent
+        self.master: tk.Misc
+
+    def position(self, relative_to):
+        if relative_to == self.master:
+            return (self.winfo_x(), self.winfo_y())
+        elif self.parent:
+            x, y = self.parent.position(relative_to)
+
+            return (x + self.winfo_x(), y + self.winfo_y())
+        else:
+            raise RuntimeError(f"{relative_to} is not above {self}")
+
+
+
 class CanvasMenu(tk.Menu):
     def __init__(self, master):
         tk.Menu.__init__(self, master, tearoff=False)
@@ -143,14 +161,13 @@ class NodeMenu(tk.Menu):
 #         ...
 
 
-def center(wid: tk.Misc) -> Tuple[int, int]:
-    x = wid.winfo_rootx()
-    y = wid.winfo_rooty()
+# def center(wid: Position) -> Tuple[int, int]:
+#     # x, y = wid.position()
 
-    x += wid.winfo_width() // 2
-    y += wid.winfo_height() // 2
+#     x += wid.winfo_width() // 2
+#     y += wid.winfo_height() // 2
 
-    return (x, y)
+#     return (x, y)
 
 
 class NodeToolbar(tk.Menu):
@@ -633,8 +650,11 @@ class NodeCanvas(tk.Canvas):
             a.connect(b)
             b.connect(a)
 
-            x1, y1 = center(a)
-            x2, y2 = center(b)
+            x1, y1 = a.position(self)
+            x2, y2 = b.position(self)
+
+            x1, y1 = x1 + a.winfo_width() // 2, y1 + a.winfo_height()
+            x2, y2 = x2 + b.winfo_width() // 2, y2 + b.winfo_height()
 
             dx = self.winfo_rootx()
             dy = self.winfo_rootx()
@@ -676,12 +696,14 @@ class Connection:
 
 
 
-class Hatch(tk.Frame):
+class Hatch(tk.Frame, Position):
     DISCONNECTED = "#FF8888"
     CONNECTED    = "#FFFFFF"
 
     def __init__(self, master: "HatchBar", is_input: bool, item_id=None, *args, **kwargs):
         tk.Frame.__init__(self, master, *args, **kwargs)
+        Position.__init__(self, master)
+
         self.master: "HatchBar"
 
         self.description = tk.StringVar()
@@ -790,9 +812,11 @@ class Hatch(tk.Frame):
             self.disconnect_all()
 
 
-class HatchBar(tk.Frame):
+class HatchBar(tk.Frame, Position):
     def __init__(self, master: "NodeFrame", is_input: bool, *args, **kwargs):
         tk.Frame.__init__(self, master, *args, **kwargs)
+        Position.__init__(self, master)
+
         self.master: "NodeFrame"
         
         self.is_input = is_input
@@ -837,11 +861,13 @@ class HatchBar(tk.Frame):
     def add_hatch(self, item_id=None):
         # TODO low: adding hatches should move connections on the canvas
         self.hatches.append(Hatch(self, self.is_input, item_id=item_id, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1))
+        self.update_colour()
         self.space()
 
     def insert_hatch(self, i, hatch):
         self.hatches.insert(i, hatch)
         self.space()
+        self.update_colour()
 
     def remove_hatch(self, hatch):
         self.master.master.hatch = None # just in case
@@ -857,12 +883,14 @@ class HatchBar(tk.Frame):
             x.place(relx=i / n, rely=0, relwidth=1 / n, relheight=1)
 
 
-class NodeFrame(tk.Frame, ABC):
+class NodeFrame(tk.Frame, Position, ABC):
     # TODO high: highlight unconnected hatches
     # TODO high: highlight nodes with unconnected hatches
 
     def __init__(self, master: NodeCanvas, x=None, y=None, inputs=None, outputs=None):
         tk.Frame.__init__(self, master)
+        Position.__init__(self, None)
+
         self.master: NodeCanvas
 
         self.model: Union[None, Step, Buffer] = None
