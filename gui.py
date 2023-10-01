@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import colorsys
 import os
 import tkinter as tk
 import time
@@ -231,23 +232,43 @@ class NodeCanvas(tk.Canvas):
     def run_sccs(self):
         self.reconstruct()
 
-        nodes = [node.model for node in self.nodes]
+        nodes = {node.model : node for node in self.nodes}
 
-        make_groups(nodes, circuits(nodes))
+        groups = circuits(nodes)
+        make_groups(groups)
+
+        n = len(groups)
+
+        for i, group in enumerate(groups):
+            r, g, b = colorsys.hsv_to_rgb(i / n, 1.0, 1.0)
+            r, g, b = int(255 * r), int(255 * g), int(255 * b)
+
+
+            for node in group:
+                col = f"#{r:02x}{g:02x}{b:02x}"
+                nodes[node].set_background(col)
 
         # for node in self.nodes:
         #     if isinstance(node.model, Step):
         #         print(node, node.model.group, node.model.pull, node.model.push)
 
     def propagate_flow(self, node: Optional["StepFrame"]):
-        self.reconstruct()
         self.run_sccs()
+
+        print("Propagating")
 
         if node is None:
             raise RuntimeError("?")
 
+        Buffer.global_reset()
+        for node_ in self.nodes:
+            if isinstance(node_, BufferFrame):
+                if node_.model is None:
+                    raise RuntimeError("Impossible")
+
+                node_.model.reset()
+
         # TODO low: report total failure
-        
         node.propagate_flow()
 
         for step in self.nodes:
@@ -256,6 +277,15 @@ class NodeCanvas(tk.Canvas):
                     raise RuntimeError("Impossible")
                 else:
                     step.rate.set(step.model.rate)
+            if isinstance(step, BufferFrame):
+                if step.model is None:
+                    raise RuntimeError("Impossible")
+                else:
+                    step.display_flow()
+        
+        for item, flow in Buffer.global_flow.items():
+            print(f"{self.item_name(item)}: {flow}")
+        print()
 
     def reconstruct(self):
         for node in self.nodes:
@@ -488,6 +518,8 @@ class NodeCanvas(tk.Canvas):
         elif mod == Gesture.CLICK | Gesture.CTRL:
             if isinstance(source, Hatch):
                 source.item_menu()
+        elif mod == Gesture.CLICK | Gesture.RIGHT | Gesture.CTRL:
+            print(source)
         elif mod == Gesture.HOLD | Gesture.SHIFT:
             self.delete(self.selection_rectangle)
         elif mod == Gesture.DRAG:
@@ -647,7 +679,8 @@ class NodeCanvas(tk.Canvas):
             if a.is_input:
                 a, b = b, a
 
-            a.connect(b)
+            if not a.connect(b):
+                return
             b.connect(a)
 
             x1, y1 = a.position(self)
@@ -773,7 +806,7 @@ class Hatch(tk.Frame, Position):
             self.set_item(target.item_id)
         elif self.item_name != target.item_name:
             print(f"Mismatched hatches {self.item_name} - {target.item_name}")
-            return
+            return False
 
         if target not in self.connections:
             self.connections.append(target)
@@ -781,6 +814,8 @@ class Hatch(tk.Frame, Position):
             self.label.configure(background=Hatch.CONNECTED)
             self.configure(background=Hatch.CONNECTED)
             self.master.update_colour()
+
+        return True
 
     def _disconnect(self, target: "Hatch"):
         if target in self.connections:
@@ -1209,6 +1244,8 @@ class StepFrame(NodeFrame):
         else:
             self.model = Step(self.recipe)
 
+            # print(self.model, self)
+
 
 class BufferFrame(NodeFrame):
     def __init__(self, master, x=0, y=0):
@@ -1223,6 +1260,13 @@ class BufferFrame(NodeFrame):
         
         for e in MOUSE_EVENTS:
             self.label.bind(e, lambda e: self.master.gesture_manager.on_event(e, self))
+
+    def display_flow(self):
+        if self.model is None:
+            ...
+        else:
+            text = "\n".join(f"{self.master.item_name(item)}: {flow}" for item, flow in self.model.flow.items())
+            self.label.config(text=text)
 
     def encode(self, hatch_tl: Dict[Hatch, Tuple[int, bool, int]]):
         return { "type": "buffer"
@@ -1255,6 +1299,8 @@ def main():
     
     root.mainloop()
 
+    return root, the_canvas
+
 
 if __name__ == "__main__":
-    main()
+    root, canvas = main()

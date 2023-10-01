@@ -102,10 +102,11 @@ class Group:
         #     cause_rate = 1.0
 
 
-    def propagate(self, cause: IVar, flow=1.0):
+    def propagate(self, cause: IVar, flow=1.0, cause_group: Optional["Group"]=None):
+        # print(f"group {self} {cause} {flow}")
+
         rate_flow, variables, outbound = self.matrix()
 
-        
         # fix the rate of cause_ by adding the corresponding equation (row)
         rate_flow = np.pad(rate_flow, ((0, 1), (0, 0)))
         flows = np.zeros(rate_flow.shape[0])
@@ -122,6 +123,9 @@ class Group:
 
         if res.sum() > 1e-15:
             print("warning high residual in cycle solution, results might be wrong")
+            print("lstsq residue:", res.sum())
+        else:
+            print("lstsq residue:", res.sum())
 
         # print(rates)
         for v, rate_ in zip(variables, rates):
@@ -132,8 +136,9 @@ class Group:
             else:
                 node, push, item = v
 
-                if v != cause:
-                    node.propagate_item(item, outbound[v], push, rate_ if push else -rate_)
+                if v != cause and (cause_group is None or node not in cause_group.steps):
+                    #print(item, v, cause, outbound[v], self.junction(*v))
+                    node.propagate_item(item, outbound[v], self, push, rate_ if push else -rate_)
 
     def neighbourhood(self) -> Set[Node]:
         # returns all nodes outside of this group with connections to this group
@@ -152,6 +157,10 @@ class Group:
 
     def junction(self, start: Node, push: bool, item: Item) -> Set[Tuple[Node, bool]]:
         # a junction is a set of connected hatches of the same type
+
+        # NOTE: hatch chains (e.g. in-out-in-out) are junctions, even though they do not look like they connect to the same point.
+        # I am not sure what this means for circuits and the current Group.propagate...
+
         seen  = set([(start, push)])
         queue = [(start, push)]
 
@@ -292,7 +301,7 @@ class Step:
         if target not in x:
             x.append(target)
 
-    def propagate(self, cause: Union[None, "Step", "Buffer"]=None, rate=1.0):
+    def propagate(self, cause: Union[None, "Step", "Buffer"]=None, cause_group: Optional[Group]=None, rate=1.0):
         if self.group:
             if not cause or cause == self:
                 self.group.propagate(self, rate)
@@ -310,8 +319,9 @@ class Step:
             except Exception as exc:
                 raise RuntimeError(f"{self} is missing a source of {item}") from exc
 
-            if target is not cause:
-                target.propagate_item(item, self, PUSH, flow)
+            if target != cause and (cause_group is None or target not in cause_group.steps):
+                # print(f"propagate: {self}, {target} {cause}")
+                target.propagate_item(item, self, None, PUSH, flow)
 
         for item in self.recipe.produce:
             flow = rate * self.recipe.outrate(item)
@@ -321,48 +331,68 @@ class Step:
             except Exception as exc:
                 raise RuntimeError(f"{self} is missing a destination for {item}") from exc
             
-            if target is not cause:
-                target.propagate_item(item, self, PULL, flow)
+            if target != cause and (cause_group is None or target not in cause_group.steps):
+                # print(f"propagate: {self}, {target} {cause}")
+                target.propagate_item(item, self, None, PULL, flow)
 
-    def propagate_item(self, item, cause: Union[None, "Step", "Buffer"]=None, push=PULL, flow=1.0):
+    def propagate_item(self, item, cause: Union[None, "Step", "Buffer"]=None, cause_group=None, push=PULL, flow=1.0):
         # note, push refers to whether self is pushing
         # so not push indicates whether cause is pushing
 
         # print("propagate_item:", self, item, cause, push, flow)
 
-        if not cause:
+        if cause is None:
             cause = self
 
-        if self.group:
-            x = cause , not push , item
-            self.group.propagate(x, -flow if push else flow)
-        else:
+        if self.group is None:
             if push:
                 rate = flow / self.recipe.outrate(item)
             else:
                 rate = flow / self.recipe.inrate(item)
 
-            self.propagate(cause=cause, rate=rate)
+            self.propagate(cause=cause, rate=rate, cause_group=cause_group)
+        else:
+            x = cause , not push , item
+            self.group.propagate(x, -flow if push else flow, cause_group=cause_group)
 
 
 class Buffer:
+    global_flow = {}
+    index = 0
+
     def __init__(self, name="Buffer"):
+        self.index = Buffer.index
+        Buffer.index = self.index + 1
+
         self.name = name
         self.flow = {}
         self.pull = {}
         self.push = {}
 
-    def __str__(self):
-        return self.name
-
     def __repr__(self):
-        return str(self)
+        return f"{self.name} ({self.index})"
+    
+    def reset(self):
+        self.flow = {}
 
-    def propagate_item(self, item, _, push, flow):
-        self.flow[item] = -flow if push else flow
+    @classmethod
+    def global_reset(cls):
+        cls.global_flow = {}
+
+    def propagate_item(self, item, cause, cause_group, push, flow):
+        # print("propagate_item:", self, item, cause, push, flow)
+
+        diff = -flow if push else flow
+
+        # print(f"{self} {item}, local {self.flow.get(item, 0)}, global {self.global_flow.get(item, 0)}, diff {diff}")
+
+        self.flow[item] = self.flow.get(item, 0) + diff
+        Buffer.global_flow[item] = Buffer.global_flow.get(item, 0) + diff
+
+        # print(f"Now {item}, local {self.flow[item]}, global {self.global_flow[item]}")
 
 
-def make_groups(nodes, sccs):
+def make_groups(sccs):
     for group in sccs:
         g = Group(group)
 
