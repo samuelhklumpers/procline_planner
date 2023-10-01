@@ -7,6 +7,7 @@ from dictproxy import DictProxy
 
 Item = str
 Push = bool
+Machine = str
 
 PULL: Push = False
 PUSH: Push = True
@@ -15,6 +16,8 @@ Node = Union["Step", "Buffer"]
 
 class Recipe:
     def __init__(self, recipe: DictProxy):
+        self.raw = recipe.unwrap()
+
         self.duration = recipe["dur"]
         self.power    = recipe["eut"]
 
@@ -260,12 +263,12 @@ class Group:
 class Step:
     index = 0
 
-    def __init__(self, recipe: DictProxy):
+    def __init__(self, recipe: Recipe):
         self.index = Step.index
         Step.index = self.index + 1
 
         # self.machine = machine if machine else Machine()
-        self.recipe = Recipe(recipe)
+        self.recipe = recipe
 
         # push maps inputs to producers (in order of priority?)
         self.pull: Dict[Item, List[Union["Step", "Buffer"]]] = {}

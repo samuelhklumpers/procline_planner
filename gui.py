@@ -12,7 +12,7 @@ from ttkwidgets.autocomplete import AutocompleteEntry
 import tkinter.simpledialog
 
 from dictproxy import DictProxy, wrap
-from throughput import Buffer, Recipe, Step, make_groups
+from throughput import Buffer, Recipe, Step, make_groups, Machine
 from tscca import circuits
 
 
@@ -304,6 +304,10 @@ class NodeCanvas(tk.Canvas):
 
         self.recipes_by_machine_by_input  = {}
         self.recipes_by_machine_by_output = {}
+
+        self.recipes_by_input  = {}
+        self.recipes_by_output = {}
+
         for machine, recipes in self.recipes_by_machine.items():
             by_input = self.recipes_by_machine_by_input[machine] = {}
             by_output = self.recipes_by_machine_by_output[machine] = {}
@@ -363,22 +367,36 @@ class NodeCanvas(tk.Canvas):
     def item_name(self, item_id):
         return self.id_to_item[item_id]
 
-    def recipe_id(self, machine, recipe):
+    def recipe_id(self, machine, recipe: DictProxy):
         return self.recipes_by_machine[machine].index(recipe)
     
-    def recipe_by_id(self, machine, recipe_id):
-        return self.recipes_by_machine[machine][recipe_id]
+    def recipe_by_id(self, machine, recipe_id) -> Recipe:
+        return Recipe(self.recipes_by_machine[machine][recipe_id])
 
-    def search_recipe(self, machine: str, inputs: List[str], outputs: List[str]):
+    def search_machine_recipe(self, inputs: List[str], outputs: List[str]) -> Dict[Machine, List[Recipe]]:
+        recipes = {}
+        for machine in self.recipes_by_machine:
+            results = self.search_recipe(machine, inputs, outputs)
+
+            if results:
+                recipes[machine] = results
+
+        return recipes
+
+    def search_recipe(self, machine: str, inputs: List[str], outputs: List[str]) -> List[Recipe]:
         # TODO low: fast(er?) recipe search
-        if inputs:
-            candidates = self.recipes_by_machine_by_input[machine][inputs[0]]
-            inputs = inputs[1:]
-        elif outputs:
-            candidates = self.recipes_by_machine_by_output[machine][outputs[0]]
-            outputs = outputs[1:]
-        else:
-            candidates = self.recipes_by_machine[machine]
+
+        try:
+            if inputs:
+                candidates = self.recipes_by_machine_by_input[machine][inputs[0]]
+                inputs = inputs[1:]
+            elif outputs:
+                candidates = self.recipes_by_machine_by_output[machine][outputs[0]]
+                outputs = outputs[1:]
+            else:
+                candidates = self.recipes_by_machine[machine]
+        except KeyError:
+            return []
 
         def match(is_input, item):
             key = "I" if is_input else "O"
@@ -400,7 +418,7 @@ class NodeCanvas(tk.Canvas):
         for item in outputs:
             candidates = filter(match(False, item), candidates)
 
-        return list(candidates)
+        return [Recipe(r) for r in candidates]
 
     def on_closing(self):
         if self.autosave:
@@ -659,13 +677,19 @@ class Connection:
 
 
 class Hatch(tk.Frame):
+    DISCONNECTED = "#FF8888"
+    CONNECTED    = "#FFFFFF"
+
     def __init__(self, master: "HatchBar", is_input: bool, item_id=None, *args, **kwargs):
         tk.Frame.__init__(self, master, *args, **kwargs)
         self.master: "HatchBar"
 
         self.description = tk.StringVar()
         self.label = tk.Label(self, textvariable=self.description)
-        self.label.configure(background="white")
+
+        self.label.configure(background=Hatch.DISCONNECTED)
+        self.configure(background=Hatch.DISCONNECTED)
+        
         self.label.pack(expand=1, fill="both")
 
         self.node: NodeFrame = master.master
@@ -720,21 +744,30 @@ class Hatch(tk.Frame):
 
     # TODO low: def revalidate(self): invalid hatches get marked red
 
-    def connect(self, target: "Hatch"):
-        # TODO low: prevent mismatched hatch connections
-        
+    def connect(self, target: "Hatch"):        
         if bool(self.item_name) > bool(target.item_name):
             target.set_item(self.item_id)
-
-        if bool(self.item_name) < bool(target.item_name):
+        elif bool(self.item_name) < bool(target.item_name):
             self.set_item(target.item_id)
+        elif self.item_name != target.item_name:
+            print(f"Mismatched hatches {self.item_name} - {target.item_name}")
+            return
 
         if target not in self.connections:
             self.connections.append(target)
 
+            self.label.configure(background=Hatch.CONNECTED)
+            self.configure(background=Hatch.CONNECTED)
+            self.master.update_colour()
+
     def _disconnect(self, target: "Hatch"):
         if target in self.connections:
             self.connections.remove(target)
+
+            if not self.connections:    
+                self.label.configure(background=Hatch.DISCONNECTED)
+                self.configure(background=Hatch.DISCONNECTED)
+                self.master.update_colour()
 
     def disconnect_all(self):
         for conn in self.connections:
@@ -786,6 +819,9 @@ class HatchBar(tk.Frame):
 
         return self
 
+    def update_colour(self):
+        self.master.update_connected_colour()
+
     def disconnect_all(self):
         for hatch in self.hatches:
             hatch.disconnect_all()
@@ -822,6 +858,9 @@ class HatchBar(tk.Frame):
 
 
 class NodeFrame(tk.Frame, ABC):
+    # TODO high: highlight unconnected hatches
+    # TODO high: highlight nodes with unconnected hatches
+
     def __init__(self, master: NodeCanvas, x=None, y=None, inputs=None, outputs=None):
         tk.Frame.__init__(self, master)
         self.master: NodeCanvas
@@ -875,6 +914,22 @@ class NodeFrame(tk.Frame, ABC):
 
         return x
 
+    @abstractmethod
+    def set_background(self, colour):
+        ...
+
+    def update_connected_colour(self):
+        good = True
+
+        for hatch in self.input_hatches.hatches + self.output_hatches.hatches:
+            if not hatch.connections:
+                good = False
+                break
+
+        if good:
+            self.set_background(Hatch.CONNECTED)
+        else:
+            self.set_background(Hatch.DISCONNECTED)
 
     @abstractmethod
     def reconstruct(self):
@@ -911,9 +966,6 @@ class NodeFrame(tk.Frame, ABC):
         self.master.delete_node(self)
 
 
-def recipe_str(recipe):
-    return str(Recipe(recipe))
-
 def ask_multiple_choice_question(master, prompt, options):
     root = tk.Toplevel(master)
 
@@ -923,7 +975,7 @@ def ask_multiple_choice_question(master, prompt, options):
 
     v = tk.IntVar()
     for i, option in enumerate(options):
-        tk.Radiobutton(root, text=recipe_str(option), variable=v, value=i).pack(anchor="w")
+        tk.Radiobutton(root, text=str(option), variable=v, value=i).pack(anchor="w")
 
     is_ok = [False]
     def ok():
@@ -955,12 +1007,13 @@ class StepFrame(NodeFrame):
         self.grid_rowconfigure(index=1, weight=4)
         self.machine = tk.StringVar()
         self.recipe_name = tk.StringVar()
-        self.recipe: Optional[DictProxy] = None
+        self.recipe: Optional[Recipe] = None
         self.recipe_id: Optional[int] = None
         self.rate   = tk.DoubleVar()
 
         invalidate_machine = self.register(self.invalidate_machine)
 
+        # TODO high: list valid machines
         self.machinebox = AutocompleteEntry(self.settings, completevalues=list(master.recipes_by_machine.keys()), textvariable=self.machine, validatecommand=(invalidate_machine,))
         self.recipebox  = tk.Label(self.settings, textvariable=self.recipe_name)
         self.recipebox.configure(background="white", borderwidth=2, relief="groove")
@@ -979,6 +1032,12 @@ class StepFrame(NodeFrame):
 
         for e in MOUSE_EVENTS:
             self.settings.bind(e, lambda e: self.master.gesture_manager.on_event(e, self))
+        
+        self.update_connected_colour()
+
+    def set_background(self, colour):
+        self.configure(background=colour)
+        self.settings.configure(background=colour)
 
     def refine(self):
         x, y = self.winfo_x(), self.winfo_y()
@@ -1001,17 +1060,16 @@ class StepFrame(NodeFrame):
         self.invalidate_recipe()
 
     def invalidate_recipe(self):
+        # TODO high: keep valid hatches
         self.remove_all()
 
         if self.recipe is not None:
-            recipe = Recipe(self.recipe)
-
             # print(recipe)
 
-            for item in recipe.consume:
+            for item in self.recipe.consume:
                 self.input_hatches.add_hatch(item)
 
-            for item in recipe.produce:
+            for item in self.recipe.produce:
                 self.output_hatches.add_hatch(item)
 
     def disconnect_all(self):
@@ -1022,11 +1080,11 @@ class StepFrame(NodeFrame):
         self.input_hatches.remove_all()
         self.output_hatches.remove_all()
 
-    def set_recipe(self, recipe=None, recipe_id=None):
+    def set_recipe(self, recipe: Optional[Recipe]=None, recipe_id=None):
         if recipe:
             self.recipe = recipe
-            recipe_id = self.master.recipe_id(self.machine.get(), recipe.unwrap())
-            self.recipe_name.set(recipe_str(self.recipe))
+            recipe_id = self.master.recipe_id(self.machine.get(), recipe.raw)
+            self.recipe_name.set(str(self.recipe))
 
             if True: # recipe_id != self.recipe_id:
                 self.invalidate_recipe()
@@ -1035,14 +1093,18 @@ class StepFrame(NodeFrame):
         elif recipe_id:
             self.recipe = self.master.recipe_by_id(self.machine.get(), recipe_id)
             self.recipe_id = recipe_id
-            self.recipe_name.set(recipe_str(self.recipe))
+            self.recipe_name.set(str(self.recipe))
 
     def select_recipe(self):
         # TODO low: validate
-        if self.machine.get():
-            inputs  = [hatch.item_id for hatch in self.input_hatches.hatches if hatch.item_id]
-            outputs = [hatch.item_id for hatch in self.output_hatches.hatches if hatch.item_id]
+        inputs  = [hatch.item_id for hatch in self.input_hatches.hatches if hatch.item_id]
+        outputs = [hatch.item_id for hatch in self.output_hatches.hatches if hatch.item_id]
+        
+        if not self.machine.get() and not (inputs + outputs):
+            print("Try setting some hatches or the machine type")
+            return
 
+        if self.machine.get():
             recipes = self.master.search_recipe(self.machine.get(), inputs, outputs)
 
             if len(recipes) == 1:
@@ -1055,6 +1117,34 @@ class StepFrame(NodeFrame):
                     self.set_recipe(recipe)
             else:
                 print("No valid recipe found :(")
+        else:
+            recipes_by_machine = self.master.search_machine_recipe(inputs, outputs)
+
+            class MR:
+                def __init__(self, m, r):
+                    self.m = m
+                    self.r = r
+
+                def __str__(self):
+                    return f"({self.m}) {self.r}"
+
+            recipes = [MR(m, r) for m, rs in recipes_by_machine.items() for r in rs]
+
+            if len(recipes) == 1:
+                mr = recipes[0]
+                machine, recipe = mr.m, mr.r
+                self.machine.set(machine)
+                self.set_recipe(recipe)
+            elif len(recipes) > 1:
+                mr = ask_multiple_choice_question(self, "Recipe?", recipes)
+
+                if mr is not None:
+                    machine, recipe = mr.m, mr.r
+                    self.machine.set(machine)
+                    self.set_recipe(recipe)
+            else:
+                print("No valid machine and recipe found :(")
+
 
     def propagate_flow(self):
         if self.model is not None:
@@ -1121,6 +1211,9 @@ class BufferFrame(NodeFrame):
 
     def reconstruct(self):
         self.model = Buffer("AE")
+
+    def set_background(self, colour):
+        self.configure(background=colour)
 
 
 
