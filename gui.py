@@ -1,23 +1,22 @@
 from abc import ABC, abstractmethod
 import colorsys
-import os
 import tkinter as tk
 import time
 import json
-import pickle
 
-from typing import Dict, Generic, List, Optional, Union, Tuple, TypeVar
+from typing import Any, Dict, List, Optional, Union, Tuple
 from enum import IntFlag, auto
 
 from ttkwidgets.autocomplete import AutocompleteEntry
 import tkinter.simpledialog
 
-from dictproxy import DictProxy, wrap
-from throughput import Buffer, Recipe, Step, make_groups, Machine
+from recipes import Recipes
+from throughput import Buffer, Recipe, Step, make_groups
 from tscca import circuits
 
 
 SAVE_FN = "procline.json"
+MOUSE_EVENTS = ["<Button-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Button-2>", "<B2-Motion>", "<ButtonRelease-2>", "<Button-3>", "<B3-Motion>", "<ButtonRelease-3>"]
 
 class TkMods(IntFlag):
     SHIFT = 0x1
@@ -29,23 +28,6 @@ class TkMods(IntFlag):
     MIDDLE = 0x200
     RIGHT = 0x400
     ALT = 0x20000
-
-MOUSE_EVENTS = ["<Button-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Button-2>", "<B2-Motion>", "<ButtonRelease-2>", "<Button-3>", "<B3-Motion>", "<ButtonRelease-3>"]
-
-
-A = TypeVar("A")
-class UnorderedPair(Generic[A]):
-    def __init__(self, x: A, y: A):
-        order = hash(x) < hash(y)
-
-        self.x = x if order else y
-        self.y = y if order else x
-
-    def __eq__(self, other):
-        return self.x == other.x and self.y == other.y
-
-    def __hash__(self) -> int:
-        return hash((self.x, self.y))
 
 
 class Gesture(IntFlag):
@@ -117,31 +99,15 @@ class GestureManager():
         self.canvas.gesture(x, y, xint, yint, mod, source)
 
 
-class Position(tk.Misc):
-    def __init__(self, parent: Optional["Position"]):
-        self.parent = parent
-        self.master: tk.Misc
-
-    def position(self, relative_to):
-        if relative_to == self.master:
-            return (self.winfo_x(), self.winfo_y())
-        elif self.parent:
-            x, y = self.parent.position(relative_to)
-
-            return (x + self.winfo_x(), y + self.winfo_y())
-        else:
-            raise RuntimeError(f"{relative_to} is not above {self}")
-
-
-
 class CanvasMenu(tk.Menu):
     def __init__(self, master):
         tk.Menu.__init__(self, master, tearoff=False)
 
-        self.coords: Tuple[int, int] = 0, 0
+        self.coords = vzero
 
-        self.add_command(label="New node", command=lambda: master.new_node(*self.coords))
-        self.add_command(label="New buffer", command=lambda: master.new_buffer(*self.coords))
+        self.add_command(label="New node", command=lambda: master.new_node(self.coords))
+        self.add_command(label="New buffer", command=lambda: master.new_buffer(self.coords))
+
 
 class NodeMenu(tk.Menu):
     def __init__(self, master: "NodeCanvas"):
@@ -151,24 +117,6 @@ class NodeMenu(tk.Menu):
         self.node: Optional["StepFrame"] = None
         self.add_command(label="Propagate from here", command=lambda: self.master.propagate_flow(self.node))
         self.add_command(label="Delete", command=lambda: (self.node.delete() if self.node is not None else None))
-
-# class JSON(ABC):
-#     @abstractmethod
-#     def encode(self) -> dict: 
-#         ...
-
-#     @abstractmethod
-#     def decode(self, d: dict): 
-#         ...
-
-
-# def center(wid: Position) -> Tuple[int, int]:
-#     # x, y = wid.position()
-
-#     x += wid.winfo_width() // 2
-#     y += wid.winfo_height() // 2
-
-#     return (x, y)
 
 
 class NodeToolbar(tk.Menu):
@@ -184,21 +132,75 @@ class NodeToolbar(tk.Menu):
         calc_menu.add_command(label="Force graph reconstruction", command=self.master.reconstruct)
 
 
-class NodeCanvas(tk.Canvas):
-    # TODO low prio: canvas in foreground -> put the nodes in canvas.create_window's
-    def __init__(self, master: tk.Tk):
-        tk.Canvas.__init__(self, master)
+class Vec2:
+    def __init__(self, x, y):
+        self.x = int(x)
+        self.y = int(y)
 
+    def __add__(self, other: "Vec2"):
+        return Vec2(self.x + other.x, self.y + self.y)
+
+    def __sub__(self, other: "Vec2"):
+        return Vec2(self.x - other.x, self.y - self.y)
+
+    def __iter__(self):
+        yield from (self.x, self.y)
+
+    def __mul__(self, m: float):
+        return Vec2(self.x * m, self.y * m)
+
+    def __truediv__(self, m: float):
+        return Vec2(self.x / m, self.y / m)
+
+    def encode(self):
+        return (self.x, self.y)
+
+
+class State(Recipes):
+    def __init__(self, master: "NodeCanvas"):
+        super(State, self).__init__()
+
+        self.master = master
+        self.gesture_manager = self.master.gesture_manager
+        self.scale  = 1.0
+        self.center = self.screencenter = Vec2(0, 0)
+
+    def init(self):
+        self.center = self.screencenter = self.master.dimensions() / 2
+
+
+class BetterWidget(tk.Widget):
+    def __init__(self, globalstate: State, **kwargs):
+        super(BetterWidget, self).__init__(**kwargs)
+        
+        self.globalstate = globalstate
+
+    def position(self):
+        """position"""
+        return Vec2(self.winfo_x(), self.winfo_y())
+
+    def dimensions(self):
+        """dimensions"""
+        return Vec2(self.winfo_width(), self.winfo_height())
+    
+
+class BetterFrame(tk.Frame):
+    def __init__(self, **kwargs):
+        super(BetterFrame, self).__init__(**kwargs)
+
+
+# TODO low prio: canvas in foreground -> put the nodes in canvas.create_window's
+class NodeCanvas(BetterWidget, tk.Canvas):
+    def __init__(self, master: tk.Tk, **kwargs):
+        self.gesture_manager = GestureManager(self)
+        super(NodeCanvas, self).__init__(globalstate=State(self), master=master, **kwargs)
         self.root = master
+
         self.menubar = NodeToolbar(self)
 
         self.autosave = SAVE_FN
-        self.recipes_by_machine = {}
         self.nodes: List[NodeFrame] = []
-        # self.sccs: List[Group] = []
-        self.load()
 
-        self.gesture_manager = GestureManager(self)
 
         self.selection: List[NodeFrame] = []
         self.hatch: Optional[Hatch] = None
@@ -226,6 +228,7 @@ class NodeCanvas(tk.Canvas):
         self.after(500, self.decode)
 
         self.focus_set()
+        self.globalstate.init()
 
         # TODO mid prio: colour groups and group lines
 
@@ -284,7 +287,7 @@ class NodeCanvas(tk.Canvas):
                     step.display_flow()
         
         for item, flow in Buffer.global_flow.items():
-            print(f"{self.item_name(item)}: {flow}")
+            print(f"{self.globalstate.item_name(item)}: {flow}")
         print()
 
     def reconstruct(self):
@@ -308,18 +311,19 @@ class NodeCanvas(tk.Canvas):
             d.append(node.encode(hatch_tl))
 
         return {"canvas": d}
+    
+    def _decode(self, canvas):
+        for d_child in canvas:
+            self.nodes.append(NodeFrame._decode(self.globalstate, self, **d_child))
 
     def decode(self, _=None):
         self.unbind("<Visibility>")
 
         try:
             with open(SAVE_FN, mode="r", encoding="utf-8") as fp:
-                d = json.load(fp) 
-                d = d["canvas"]
-
-                for d_child in d:
-                    self.nodes.append(NodeFrame._decode(self, d_child))
-
+                d = json.load(fp)
+                
+                self._decode(**d)
                 self.update()
 
                 for node in self.nodes:
@@ -328,144 +332,6 @@ class NodeCanvas(tk.Canvas):
                 self.after_idle(self.drag_finish)
         except OSError:
             pass
-            # the_canvas.autosave = ""
-
-    def load(self):
-        if os.path.exists("recipes.pickle"):
-            with open("recipes.pickle", mode="rb") as fp:
-                recipes = pickle.load(fp)
-        else:
-            with open("recipes.json", mode="r", encoding="utf-8") as fp:
-                recipes = json.load(fp)
-            
-            with open("recipes.pickle", mode="wb") as fp:
-                pickle.dump(recipes, fp)
-            
-        recipes = wrap(recipes)
-        recipes_by_machine = recipes.sources[0]["machines"]
-
-        for machine in recipes_by_machine:
-            self.recipes_by_machine[machine.n] = machine.recs
-
-        self.recipes_by_machine["None"] = []
-
-        self.recipes_by_machine_by_input  = {}
-        self.recipes_by_machine_by_output = {}
-
-        self.recipes_by_input  = {}
-        self.recipes_by_output = {}
-
-        for machine, recipes in self.recipes_by_machine.items():
-            by_input = self.recipes_by_machine_by_input[machine] = {}
-            by_output = self.recipes_by_machine_by_output[machine] = {}
-
-            for recipe in recipes:
-                for item in recipe.iI:
-                    by_input.setdefault(item.uN, []).append(recipe)
-                for item in recipe.fI:
-                    by_input.setdefault(item.uN, []).append(recipe)
-                for item in recipe.iO:
-                    by_output.setdefault(item.uN, []).append(recipe)
-                for item in recipe.fO:
-                    by_output.setdefault(item.uN, []).append(recipe)
-
-        try:
-            with open("items.pickle", mode="rb") as fp:
-                self.itemlist, self.id_to_item = wrap(pickle.load(fp))
-        except (OSError, KeyError, ValueError, TypeError):
-            items = {}
-            id_to_item = {}
-
-            for _, recipes in self.recipes_by_machine.items():
-                for recipe in recipes:
-                    for item in recipe.iI:
-                        ids = items.setdefault(item.lN, [])
-                        id_to_item.setdefault(item.uN, item.lN)
-                        if item.uN not in ids:
-                            ids.append(item.uN)
-
-                    for item in recipe.iO:
-                        ids = items.setdefault(item.lN, [])
-                        id_to_item.setdefault(item.uN, item.lN)
-                        if item.uN not in ids:
-                            ids.append(item.uN)
-
-                    for item in recipe.fI:
-                        ids = items.setdefault(item.lN, [])
-                        id_to_item.setdefault(item.uN, item.lN)
-                        if item.uN not in ids:
-                            ids.append(item.uN)
-
-                    for item in recipe.fO:
-                        ids = items.setdefault(item.lN, [])
-                        id_to_item.setdefault(item.uN, item.lN)
-                        if item.uN not in ids:
-                            ids.append(item.uN)
-
-            self.id_to_item = id_to_item
-            self.itemlist   = wrap(items)
-
-            with open("items.pickle", mode="wb") as fp:
-                pickle.dump((items, id_to_item), fp)
-
-        self.itemlist[""]   = "null"
-        self.id_to_item[""] = ""
-    
-    def item_name(self, item_id):
-        return self.id_to_item[item_id]
-
-    def recipe_id(self, machine, recipe: DictProxy):
-        return self.recipes_by_machine[machine].index(recipe)
-    
-    def recipe_by_id(self, machine, recipe_id) -> Recipe:
-        return Recipe(self.recipes_by_machine[machine][recipe_id])
-
-    def search_machine_recipe(self, inputs: List[str], outputs: List[str]) -> Dict[Machine, List[Recipe]]:
-        recipes = {}
-        for machine in self.recipes_by_machine:
-            results = self.search_recipe(machine, inputs, outputs)
-
-            if results:
-                recipes[machine] = results
-
-        return recipes
-
-    def search_recipe(self, machine: str, inputs: List[str], outputs: List[str]) -> List[Recipe]:
-        # TODO low: fast(er?) recipe search
-
-        try:
-            if inputs:
-                candidates = self.recipes_by_machine_by_input[machine][inputs[0]]
-                inputs = inputs[1:]
-            elif outputs:
-                candidates = self.recipes_by_machine_by_output[machine][outputs[0]]
-                outputs = outputs[1:]
-            else:
-                candidates = self.recipes_by_machine[machine]
-        except KeyError:
-            return []
-
-        def match(is_input, item):
-            key = "I" if is_input else "O"
-            keyi = "i" + key
-            keyf = "f" + key
-            def match_(candidate):
-                for qty in candidate[keyi]:
-                    if item == qty.uN:
-                        return True
-                for qty in candidate[keyf]:
-                    if item == qty.uN:
-                        return True
-                return False
-            return match_
-
-        for item in inputs:
-            candidates = filter(match(True, item), candidates)
-
-        for item in outputs:
-            candidates = filter(match(False, item), candidates)
-
-        return [Recipe(r) for r in candidates]
 
     def on_closing(self):
         if self.autosave:
@@ -509,7 +375,7 @@ class NodeCanvas(tk.Canvas):
                 self.node_menu.node = source
             else:
                 self.canv_menu.tk_popup(x, y, 0)
-                self.canv_menu.coords = (xint, yint)
+                self.canv_menu.coords = Vec2(xint, yint)
         elif mod == Gesture.CLICK | Gesture.SHIFT:
             self.delete(self.selection_rectangle)
             self.selection_rectangle = 0
@@ -641,8 +507,8 @@ class NodeCanvas(tk.Canvas):
             self.select(child)
             child.focus_set()
 
-    def new_node(self, x, y):
-        node = StepFrame(self, x, y)
+    def new_node(self, pos: Vec2):
+        node = StepFrame(master=self, globalstate=self.globalstate, pos=pos)
         self.nodes.append(node)
         node.drag_init()
 
@@ -667,8 +533,8 @@ class NodeCanvas(tk.Canvas):
         for child in self.selection.copy():
             self.delete_node(child)
 
-    def new_buffer(self, x, y):
-        node = BufferFrame(self, x, y)
+    def new_buffer(self, pos: Vec2):
+        node = BufferFrame(master=self, globalstate=self.globalstate, pos=pos)
         self.nodes.append(node)
         node.drag_init()
 
@@ -683,16 +549,14 @@ class NodeCanvas(tk.Canvas):
                 return
             b.connect(a)
 
-            x1, y1 = a.position(self)
-            x2, y2 = b.position(self)
+            x1, y1 = a.relative_position(self)
+            x2, y2 = b.relative_position(self)
 
             x1, y1 = x1 + a.winfo_width() // 2, y1 + a.winfo_height()
             x2, y2 = x2 + b.winfo_width() // 2, y2 + b.winfo_height()
 
             dx = self.winfo_rootx()
             dy = self.winfo_rootx()
-
-            # print(dx, dy)
 
             conn = Connection(self, self.create_line(x1 - dx, y1 - dy, x2 - dx, y2 - dy, fill="#00FF00", width=3))
 
@@ -715,267 +579,57 @@ class NodeCanvas(tk.Canvas):
             else:
                 self.disconnect(a, b)
 
+vzero = Vec2(0, 0)
 
-class Connection:
-    def __init__(self, canvas: NodeCanvas, line: int):
-        self.line = line
-        self.drag_start = canvas.coords(line)
+class Position(BetterWidget):
+    def __init__(self, master: tk.Widget, parent: Optional["Position"], globalstate: State, pos=vzero, force=False, **kwargs):
+        super(BetterWidget, self).__init__(master=master, **kwargs)
 
+        self.parent = parent
+        self.master: tk.Widget
+        self.globalstate = globalstate
 
-# class SearchMenu(tk.Frame):
-#    def __init__(self, master, values):
-#        tk.Frame.__init__(self, master)
+        self.pos = pos
+        self.force = force
 
+        self.init()
 
+    def relative_position(self, relative_to) -> Vec2:
+        if relative_to == self.master:
+            return self.position()
+        elif self.parent:
+            return self.parent.relative_position(relative_to) + self.position()
+        else:
+            raise RuntimeError(f"{relative_to} is not above {self}")
 
+    def reposition(self):
+        if self.force:
+            p = (self.pos - self.globalstate.center) * self.globalstate.scale + self.globalstate.screencenter
+            x, y = p
+            self.place(x=x, y=y)
 
-class Hatch(tk.Frame, Position):
-    DISCONNECTED = "#FF8888"
-    CONNECTED    = "#FFFFFF"
+    def init(self):
+        if self.force:
+            x, y = self.pos
+            self.place(x=x, y=y)
 
-    def __init__(self, master: "HatchBar", is_input: bool, item_id=None, *args, **kwargs):
-        tk.Frame.__init__(self, master, *args, **kwargs)
-        Position.__init__(self, master)
+    def encode(self) -> Dict[str, Any]:
+        return {"pos": self.pos.encode()}
 
-        self.master: "HatchBar"
-
-        self.description = tk.StringVar()
-        self.label = tk.Label(self, textvariable=self.description)
-
-        self.label.configure(background=Hatch.DISCONNECTED)
-        self.configure(background=Hatch.DISCONNECTED)
-        
-        self.label.pack(expand=1, fill="both")
-
-        self.node: NodeFrame = master.master
-        self.item_name = ""
-        self.item_id   = ""
-
-        if item_id is not None:
-            self.set_item(item_id)
-
-        self.is_input = is_input
-        self.connections: List[Hatch] = []
-
-        self.d_connections = {}
-
-        self.configure(highlightcolor="#00AAFF")
-
-    
-        for e in MOUSE_EVENTS:
-            self.bind(e, lambda e: self.master.master.master.gesture_manager.on_event(e, self))
-            self.label.bind(e, lambda e: self.master.master.master.gesture_manager.on_event(e, self))
-
-        self.bind("<Delete>", lambda e: self.master.remove_hatch(self))
-
-    def remove(self):
-        self.disconnect_all()
-        self.destroy()
-
-    def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
-        return { "connections": [hatch_tl[x] for x in self.connections]
-               , "id": self.item_id
-               , "name": self.item_name }
-
-    def decode(self, d):
-        self.d_connections = d["connections"]
-        self.set_item(d["id"])
-    
-    def set_item(self, item_id):
-        # , item_name):
-        self.item_id = item_id
-        self.item_name = self.master.master.master.item_name(item_id)
-        self.description.set(self.item_name)
-
-    def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
-        for [i, x, j] in self.d_connections:
-            i: int
-            x: bool
-            j: int
-
-            node = nodes[i]
-            hatchbar = node.output_hatches if x else node.input_hatches
-            canvas.connect(self, hatchbar.hatches[j])
-
-    # TODO low: def revalidate(self): invalid hatches get marked red
-
-    def connect(self, target: "Hatch"):        
-        if bool(self.item_name) > bool(target.item_name):
-            target.set_item(self.item_id)
-        elif bool(self.item_name) < bool(target.item_name):
-            self.set_item(target.item_id)
-        elif self.item_name != target.item_name:
-            print(f"Mismatched hatches {self.item_name} - {target.item_name}")
-            return False
-
-        if target not in self.connections:
-            self.connections.append(target)
-
-            self.label.configure(background=Hatch.CONNECTED)
-            self.configure(background=Hatch.CONNECTED)
-            self.master.update_colour()
-
-        return True
-
-    def _disconnect(self, target: "Hatch"):
-        if target in self.connections:
-            self.connections.remove(target)
-
-            if not self.connections:    
-                self.label.configure(background=Hatch.DISCONNECTED)
-                self.configure(background=Hatch.DISCONNECTED)
-                self.master.update_colour()
-
-    def disconnect_all(self):
-        for conn in self.connections:
-            self.master.master.master.disconnect(self, conn)
-
-    def item_menu(self):
-        item_name = tkinter.simpledialog.askstring("Item name?", "Item name?", initialvalue=self.item_name)
-        item_id = ""
-
-        if item_name is None:
-            return
-
-        try:
-            item_id = self.master.master.master.itemlist[item_name][0] # TODO low: lol
-            self.set_item(item_id) # bit inefficient but ok
-        except:
-            print("Warning:", item_name, "is an invalid item name")
-
-        if item_id != self.item_id:
-            self.disconnect_all()
+    def decode(self, pos):
+        self.pos = Vec2(*pos)
+        self.init()
 
 
-class HatchBar(tk.Frame, Position):
-    def __init__(self, master: "NodeFrame", is_input: bool, *args, **kwargs):
-        tk.Frame.__init__(self, master, *args, **kwargs)
-        Position.__init__(self, master)
-
-        self.master: "NodeFrame"
-        
-        self.is_input = is_input
-        self.plus = tk.Button(self, text="+", command=self.add_hatch)
-        self.hatches: List[Hatch] = []
-
-        self.space()
-
-    def encode(self, hatch_tl: Dict[Hatch, Tuple[int, bool, int]]):
-        d = []
-
-        for hatch in self.hatches:
-            d.append(hatch.encode(hatch_tl))
-
-        return d
-
-    def decode(self, d):
-        for d_hatch in d:
-            # print(self, d_hatch)
-            hatch = Hatch(self, self.is_input, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1)
-            hatch.decode(d_hatch)
-            self.insert_hatch(len(self.hatches), hatch)
-            # print(self.hatches)
-
-        return self
-
-    def update_colour(self):
-        self.master.update_connected_colour()
-
-    def disconnect_all(self):
-        for hatch in self.hatches:
-            hatch.disconnect_all()
-
-    def remove_all(self):
-        for hatch in list(self.hatches):
-            self.remove_hatch(hatch)
-
-    def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
-        for hatch in self.hatches:
-            hatch.tie(canvas, nodes)
-
-    def add_hatch(self, item_id=None):
-        # TODO low: adding hatches should move connections on the canvas
-        self.hatches.append(Hatch(self, self.is_input, item_id=item_id, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1))
-        self.update_colour()
-        self.space()
-
-    def insert_hatch(self, i, hatch):
-        self.hatches.insert(i, hatch)
-        self.space()
-        self.update_colour()
-
-    def remove_hatch(self, hatch):
-        self.master.master.hatch = None # just in case
-        self.hatches.remove(hatch)
-        hatch.remove()
-        self.space()
-
-    def space(self):
-        xs = [self.plus] + self.hatches
-        n = len(xs)
-
-        for i, x in enumerate(xs):
-            x.place(relx=i / n, rely=0, relwidth=1 / n, relheight=1)
-
-
-class NodeFrame(tk.Frame, Position, ABC):
-    # TODO high: highlight unconnected hatches
-    # TODO high: highlight nodes with unconnected hatches
-
-    def __init__(self, master: NodeCanvas, x=None, y=None, inputs=None, outputs=None):
-        tk.Frame.__init__(self, master)
-        Position.__init__(self, None)
-
+class Hatches(Position, BetterFrame, ABC):
+    def __init__(self, globalstate: State, master: NodeCanvas, inputs=None, outputs=None, **kwargs):
+        super(Hatches, self).__init__(globalstate=globalstate, master=master, **kwargs)
         self.master: NodeCanvas
 
-        self.model: Union[None, Step, Buffer] = None
-
         self.input_hatches  = inputs if inputs else \
-                              HatchBar(self, True, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1)
+            HatchBar(master=self, globalstate=globalstate, is_input=True)
         self.output_hatches = outputs if outputs else \
-                              HatchBar(self, False, background="#FFFFFF", highlightbackground="#000000", highlightthickness=1)
-
-        self.input_hatches.grid(row=0, column=0, sticky="nesw")
-        self.output_hatches.grid(row=2, column=0, sticky="nesw")
-
-        self.grid_rowconfigure(index=0, weight=1)
-        self.grid_rowconfigure(index=2, weight=1)
-        self.grid_columnconfigure(index=0, weight=1)
-
-        x = x if x else 40
-        y = y if y else 40
-
-        # True iff the last mouse interaction (in this widget) was a motion event (as opposed to a single click)
-        self.drag_start: Tuple[int, int] = 0, 0
-
-        self.place(x=x, y=y, width=200, height=200)
-        self.configure(background="#FFFFFF", highlightbackground="#000000", highlightcolor="#0000FF", highlightthickness=1)
-    
-        self.bind("<Delete>", lambda e: self.master.delete_selection())
-        # self.bind("x", lambda e: print(self.winfo_rootx(), self.winfo_rooty(), self.master.winfo_rootx(), self.master.winfo_rooty()))
-
-    # TODO low: disconnect all button
-
-    @abstractmethod
-    def encode(self, hatch_tl: Dict[Hatch, Tuple[int, bool, int]]):
-        ...
-
-    @abstractmethod
-    def decode(self, d):
-        ...
-
-    @classmethod
-    def _decode(cls, master, d):
-        if d.get("type", "step") == "step":
-            x = StepFrame(master)
-            x.decode(d)
-        elif d["type"] == "buffer":
-            x = BufferFrame(master)
-            x.decode(d)
-        else:
-            raise RuntimeError()
-
-        return x
+            HatchBar(master=self, globalstate=globalstate, is_input=False)
 
     @abstractmethod
     def set_background(self, colour):
@@ -993,6 +647,65 @@ class NodeFrame(tk.Frame, Position, ABC):
             self.set_background(Hatch.CONNECTED)
         else:
             self.set_background(Hatch.DISCONNECTED)
+
+    def disconnect(self, a, b):
+        self.master.disconnect(a, b)
+
+    def encode(self, hatch_tl):
+        d = super(Hatches, self).encode()
+        d["inputs"]  = self.input_hatches.encode(hatch_tl)
+        d["outputs"] = self.output_hatches.encode(hatch_tl)
+
+        return d
+
+    def decode(self, inputs, outputs, **kwargs):
+        super(Hatches, self).decode(**kwargs)
+
+        self.input_hatches.decode(*inputs)
+        self.output_hatches.decode(*outputs)
+
+
+class NodeFrame(Hatches, ABC):
+    def __init__(self, master: NodeCanvas, **kwargs):
+        super(NodeFrame, self).__init__(master=master, parent=None, force=True, **kwargs)
+        self.master: NodeCanvas
+
+        self.model: Union[None, Step, Buffer] = None
+
+        self.input_hatches.grid(row=0, column=0, sticky="nesw")
+        self.output_hatches.grid(row=2, column=0, sticky="nesw")
+
+        self.grid_rowconfigure(index=0, weight=1)
+        self.grid_rowconfigure(index=2, weight=1)
+        self.grid_columnconfigure(index=0, weight=1)
+
+        self.drag_start: Tuple[int, int] = 0, 0
+
+        self.place(width=200, height=200)
+        self.configure(background="#FFFFFF", highlightbackground="#000000", highlightcolor="#0000FF", highlightthickness=1)
+    
+        self.bind("<Delete>", lambda e: self.master.delete_selection())
+
+    # TODO low: disconnect all button
+    @abstractmethod
+    def encode(self, hatch_tl):
+        return super(NodeFrame, self).encode(hatch_tl)
+
+    def decode(self, **d):
+        super(NodeFrame, self).decode(**d)
+
+    @classmethod
+    def _decode(cls, globalstate, master, **d):
+        if d.get("type", "step") == "step":
+            x = StepFrame(globalstate=globalstate, master=master)
+            x.decode(**d)
+        elif d["type"] == "buffer":
+            x = BufferFrame(globalstate=globalstate, master=master)
+            x.decode(**d)
+        else:
+            raise RuntimeError()
+
+        return x
 
     @abstractmethod
     def reconstruct(self):
@@ -1059,8 +772,8 @@ def ask_multiple_choice_question(master, prompt, options):
 
 
 class StepFrame(NodeFrame):
-    def __init__(self, master, x=0, y=0):
-        NodeFrame.__init__(self, master, x, y)
+    def __init__(self, **kwargs):
+        super(StepFrame, self).__init__(**kwargs)
 
         self.model: Optional[Step]
 
@@ -1077,7 +790,7 @@ class StepFrame(NodeFrame):
         invalidate_machine = self.register(self.invalidate_machine)
 
         # TODO high: list valid machines
-        self.machinebox = AutocompleteEntry(self.settings, completevalues=list(master.recipes_by_machine.keys()), textvariable=self.machine, validatecommand=(invalidate_machine,))
+        self.machinebox = AutocompleteEntry(self.settings, completevalues=list(self.globalstate.recipes_by_machine.keys()), textvariable=self.machine, validatecommand=(invalidate_machine,))
         self.recipebox  = tk.Label(self.settings, textvariable=self.recipe_name)
         self.recipebox.configure(background="white", borderwidth=2, relief="groove")
         self.ratebox    = tk.Entry(self.settings, textvariable=self.rate)
@@ -1103,16 +816,16 @@ class StepFrame(NodeFrame):
         self.settings.configure(background=colour)
 
     def refine(self):
-        x, y = self.winfo_x(), self.winfo_y()
+        p = self.position()
 
         if self.recipe is not None:
             for n, hatch in enumerate(self.input_hatches.hatches):
                 if not hatch.connections:
-                    self.master.new_node(x - 100 + 50 * n, y - 300)
+                    self.master.new_node(p + Vec2(-100 + 50 *  n, -300))
 
             for n, hatch in enumerate(self.output_hatches.hatches):
                 if not hatch.connections:
-                    self.master.new_node(x - 100 + 50 * n, y + 300)
+                    self.master.new_node(p + Vec2(-100 + 50 *  n, 300))
 
     def invalidate_machine(self):
         # print("Invalidate!")
@@ -1146,7 +859,7 @@ class StepFrame(NodeFrame):
     def set_recipe(self, recipe: Optional[Recipe]=None, recipe_id=None):
         if recipe:
             self.recipe = recipe
-            recipe_id = self.master.recipe_id(self.machine.get(), recipe.raw)
+            recipe_id = self.globalstate.recipe_id(self.machine.get(), recipe.raw)
             self.recipe_name.set(str(self.recipe))
 
             if True: # recipe_id != self.recipe_id:
@@ -1154,7 +867,7 @@ class StepFrame(NodeFrame):
 
             self.recipe_id = recipe_id
         elif recipe_id:
-            self.recipe = self.master.recipe_by_id(self.machine.get(), recipe_id)
+            self.recipe = self.globalstate.recipe_by_id(self.machine.get(), recipe_id)
             self.recipe_id = recipe_id
             self.recipe_name.set(str(self.recipe))
 
@@ -1168,7 +881,7 @@ class StepFrame(NodeFrame):
             return
 
         if self.machine.get():
-            recipes = self.master.search_recipe(self.machine.get(), inputs, outputs)
+            recipes = self.globalstate.search_recipe(self.machine.get(), inputs, outputs)
 
             if len(recipes) == 1:
                 self.set_recipe(recipes[0])
@@ -1181,7 +894,7 @@ class StepFrame(NodeFrame):
             else:
                 print("No valid recipe found :(")
         else:
-            recipes_by_machine = self.master.search_machine_recipe(inputs, outputs)
+            recipes_by_machine = self.globalstate.search_machine_recipe(inputs, outputs)
 
             class MR:
                 def __init__(self, m, r):
@@ -1214,29 +927,26 @@ class StepFrame(NodeFrame):
             # TODO low: validate
             self.model.propagate(rate=self.rate.get())
 
-    def encode(self, hatch_tl: Dict[Hatch, Tuple[int, bool, int]]):
-        return { "type": "step"
-               , "pos": (self.winfo_x(), self.winfo_y())
-               , "machine": self.machine.get()
-               , "recipe": self.recipe_id
-               , "rate": self.rate.get()
-               , "inputs": self.input_hatches.encode(hatch_tl)
-               , "outputs": self.output_hatches.encode(hatch_tl)}
-    
-    def decode(self, d):
-        x, y = d["pos"]
-        self.place(x=x, y=y)
+    def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
+        d = super(StepFrame, self).encode(hatch_tl)
 
-        self.machine.set(d.get("machine", ""))
-        self.recipe_id = d.get("recipe")
+        d.update({ "type": "step"
+                 , "machine": self.machine.get()
+                 , "recipe": self.recipe_id
+                 , "rate": self.rate.get()})
+
+        return d
+
+    def decode(self, machine, recipe_id, rate, **d):
+        super(StepFrame, self).decode(**d)
+
+        self.machine.set(machine)
+        self.recipe_id = recipe_id
 
         if self.recipe_id is not None:
             self.set_recipe(recipe_id=self.recipe_id)
 
-        self.rate.set(d.get("rate", ""))
-
-        self.input_hatches.decode(d.get("inputs", []))
-        self.output_hatches.decode(d.get("outputs", []))
+        self.rate.set(rate)
 
     def reconstruct(self):
         if self.recipe is None:
@@ -1248,8 +958,8 @@ class StepFrame(NodeFrame):
 
 
 class BufferFrame(NodeFrame):
-    def __init__(self, master, x=0, y=0):
-        NodeFrame.__init__(self, master, x, y)
+    def __init__(self, **kwargs):
+        super(NodeFrame, self).__init__(**kwargs)
 
         self.model: Optional[Buffer]
         self.label = tk.Label(self, text="AE")
@@ -1265,21 +975,17 @@ class BufferFrame(NodeFrame):
         if self.model is None:
             ...
         else:
-            text = "\n".join(f"{self.master.item_name(item)}: {flow}" for item, flow in self.model.flow.items())
+            text = "\n".join(f"{self.globalstate.item_name(item)}: {flow}" for item, flow in self.model.flow.items())
             self.label.config(text=text)
 
-    def encode(self, hatch_tl: Dict[Hatch, Tuple[int, bool, int]]):
-        return { "type": "buffer"
-               , "pos": (self.winfo_x(), self.winfo_y())
-               , "inputs": self.input_hatches.encode(hatch_tl)
-               , "outputs": self.output_hatches.encode(hatch_tl)}
-    
-    def decode(self, d):
-        x, y = d["pos"]
-        self.place(x=x, y=y)
+    def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
+        d = super(BufferFrame, self).encode(hatch_tl)
+        d["type"] = "buffer"
 
-        self.input_hatches.decode(d.get("inputs", []))
-        self.output_hatches.decode(d.get("outputs", []))
+        return d
+ 
+    def decode(self, **d):
+        super(BufferFrame, self).decode(**d)
 
     def reconstruct(self):
         self.model = Buffer("AE")
@@ -1287,6 +993,198 @@ class BufferFrame(NodeFrame):
     def set_background(self, colour):
         self.configure(background=colour)
 
+
+class HatchBar(Position, BetterFrame):
+    def __init__(self, master: Hatches, is_input: bool, **kwargs):
+        super(HatchBar, self).__init__(master=master, parent=master, force=False, **kwargs)
+        self.master: Hatches
+
+        self.configure(background="#FFFFFF", highlightbackground="#000000", highlightthickness=1)
+
+        self.is_input = is_input
+        self.plus = tk.Button(self, text="+", command=self.add_hatch)
+        self.hatches: List[Hatch] = []
+
+        self.space()
+
+    def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
+        d = []
+        for hatch in self.hatches:
+            d.append(hatch.encode(hatch_tl))
+
+        return d
+
+    def decode(self, *d):
+        for d_hatch in d:
+            hatch = Hatch(master=self, item_id="", globalstate=self.globalstate, is_input=self.is_input)
+            hatch.decode(**d_hatch)
+            self.insert_hatch(len(self.hatches), hatch)
+
+        return self
+
+    def update_colour(self):
+        self.master.update_connected_colour()
+
+    def disconnect(self, a, b):
+        self.master.disconnect(a, b)
+
+    def disconnect_all(self):
+        for hatch in self.hatches:
+            hatch.disconnect_all()
+
+    def remove_all(self):
+        for hatch in list(self.hatches):
+            self.remove_hatch(hatch)
+
+    def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
+        for hatch in self.hatches:
+            hatch.tie(canvas, nodes)
+
+    def add_hatch(self, item_id=None):
+        # TODO low: adding hatches should move connections on the canvas
+        self.hatches.append(Hatch(master=self, globalstate=self.globalstate, is_input=self.is_input, item_id=item_id))
+        self.update_colour()
+        self.space()
+
+    def insert_hatch(self, i, hatch):
+        self.hatches.insert(i, hatch)
+        self.space()
+        self.update_colour()
+
+    def remove_hatch(self, hatch):
+        self.hatches.remove(hatch)
+        hatch.remove()
+        self.space()
+
+    def space(self):
+        xs = [self.plus] + self.hatches
+        n = len(xs)
+
+        for i, x in enumerate(xs):
+            x.place(relx=i / n, rely=0, relwidth=1 / n, relheight=1)
+
+
+class Connection:
+    def __init__(self, canvas: NodeCanvas, line: int):
+        self.line = line
+        self.drag_start = canvas.coords(line)
+
+
+class Hatch(Position, BetterFrame):
+    DISCONNECTED = "#FF8888"
+    CONNECTED    = "#FFFFFF"
+
+    def __init__(self, master: "HatchBar", is_input=False, item_id=None, **kwargs):
+        super(Hatch, self).__init__(master=master, parent=master, force=False, **kwargs)
+        self.configure(background="#FFFFFF", highlightbackground="#000000", highlightthickness=1)
+        self.master: "HatchBar"
+
+        self.description = tk.StringVar()
+        self.label = tk.Label(self, textvariable=self.description)
+
+        self.label.configure(background=Hatch.DISCONNECTED)
+        self.configure(background=Hatch.DISCONNECTED)
+        
+        self.label.pack(expand=1, fill="both")
+
+        self.node: Hatches = master.master
+        self.item_name = ""
+        self.item_id   = ""
+
+        if item_id is not None:
+            self.set_item(item_id)
+
+        self.is_input = is_input
+        self.connections: List[Hatch] = []
+
+        self.d_connections = {}
+
+        self.configure(highlightcolor="#00AAFF")
+
+    
+        for e in MOUSE_EVENTS:
+            self.bind(e, lambda e: self.globalstate.gesture_manager.on_event(e, self))
+            self.label.bind(e, lambda e: self.globalstate.gesture_manager.on_event(e, self))
+
+        self.bind("<Delete>", lambda e: self.master.remove_hatch(self))
+
+    def remove(self):
+        self.disconnect_all()
+        self.destroy()
+
+    def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
+        return { "connections": [hatch_tl[x] for x in self.connections]
+               , "id": self.item_id
+               , "name": self.item_name }
+
+    def decode(self, connections, item_id, item_name):
+        self.d_connections = connections
+        self.set_item(item_id)
+    
+    def set_item(self, item_id):
+        # , item_name):
+        self.item_id = item_id
+        self.item_name = self.globalstate.item_name(item_id)
+        self.description.set(self.item_name)
+
+    def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
+        for [i, x, j] in self.d_connections:
+            i: int
+            x: bool
+            j: int
+
+            node = nodes[i]
+            hatchbar = node.output_hatches if x else node.input_hatches
+            canvas.connect(self, hatchbar.hatches[j])
+
+    # TODO low: def revalidate(self): invalid hatches get marked red
+
+    def connect(self, target: "Hatch"):        
+        if bool(self.item_name) > bool(target.item_name):
+            target.set_item(self.item_id)
+        elif bool(self.item_name) < bool(target.item_name):
+            self.set_item(target.item_id)
+        elif self.item_name != target.item_name:
+            print(f"Mismatched hatches {self.item_name} - {target.item_name}")
+            return False
+
+        if target not in self.connections:
+            self.connections.append(target)
+
+            self.label.configure(background=Hatch.CONNECTED)
+            self.configure(background=Hatch.CONNECTED)
+            self.master.update_colour()
+
+        return True
+
+    def _disconnect(self, target: "Hatch"):
+        if target in self.connections:
+            self.connections.remove(target)
+
+            if not self.connections:    
+                self.label.configure(background=Hatch.DISCONNECTED)
+                self.configure(background=Hatch.DISCONNECTED)
+                self.master.update_colour()
+
+    def disconnect_all(self):
+        for conn in self.connections:
+            self.master.disconnect(self, conn)
+
+    def item_menu(self):
+        item_name = tkinter.simpledialog.askstring("Item name?", "Item name?", initialvalue=self.item_name)
+        item_id = ""
+
+        if item_name is None:
+            return
+
+        try:
+            item_id = self.globalstate.itemlist[item_name][0] # TODO low: lol
+            self.set_item(item_id) # bit inefficient but ok
+        except:
+            print("Warning:", item_name, "is an invalid item name")
+
+        if item_id != self.item_id:
+            self.disconnect_all()
 
 
 def main():
