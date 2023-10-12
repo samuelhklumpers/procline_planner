@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import colorsys
+import math
 import tkinter as tk
 import time
 import json
@@ -16,7 +17,7 @@ from tscca import circuits
 
 
 SAVE_FN = "procline.json"
-MOUSE_EVENTS = ["<Button-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Button-2>", "<B2-Motion>", "<ButtonRelease-2>", "<Button-3>", "<B3-Motion>", "<ButtonRelease-3>"]
+MOUSE_EVENTS = ["<Button-1>", "<B1-Motion>", "<ButtonRelease-1>", "<Button-2>", "<B2-Motion>", "<ButtonRelease-2>", "<Button-3>", "<B3-Motion>", "<ButtonRelease-3>", "<MouseWheel>"]
 
 class TkMods(IntFlag):
     SHIFT = 0x1
@@ -35,7 +36,8 @@ class Gesture(IntFlag):
     CLICK = auto()
     DRAG  = auto()
     DRAG_END = auto()
-    HOLD  = auto()
+    HOLD   = auto()
+    SCROLL = auto()
 
     RIGHT  = auto()
     MIDDLE = auto()
@@ -57,10 +59,12 @@ class GestureManager():
         self.mod = 0
 
     def on_event(self, e: tk.Event, source: Union["NodeCanvas", "NodeFrame", "Hatch"]):
-        x, y = e.x_root, e.y_root
-        xint, yint = e.x, e.y
+        pos = Vec2(e.x_root, e.y_root)
+        posi = Vec2(e.x, e.y)
         mod = Gesture(0)
         submod = 0
+
+        # print(e, e.state, e.type)
 
         mod |= self.mod
 
@@ -95,8 +99,12 @@ class GestureManager():
             else:
                 mod |= Gesture.HOLD
             self.mod = 0
+        elif e.type == tk.EventType.MouseWheel:
+            mod |= Gesture.SCROLL
+            pos = Vec2(e.delta, 0)
 
-        self.canvas.gesture(x, y, xint, yint, mod, source)
+
+        self.canvas.gesture(pos, posi, mod, source)
 
 
 class CanvasMenu(tk.Menu):
@@ -137,11 +145,14 @@ class Vec2:
         self.x = int(x)
         self.y = int(y)
 
+    def __repr__(self):
+        return f"Vec2({self.x}, {self.y})"
+
     def __add__(self, other: "Vec2"):
-        return Vec2(self.x + other.x, self.y + self.y)
+        return Vec2(self.x + other.x, self.y + other.y)
 
     def __sub__(self, other: "Vec2"):
-        return Vec2(self.x - other.x, self.y - self.y)
+        return Vec2(self.x - other.x, self.y - other.y)
 
     def __iter__(self):
         yield from (self.x, self.y)
@@ -204,14 +215,14 @@ class NodeCanvas(BetterWidget, tk.Canvas):
 
         self.selection: List[NodeFrame] = []
         self.hatch: Optional[Hatch] = None
-        self.drag_start: Tuple[int, int] = 0, 0
-        self.drag_starti: Tuple[int, int] = 0, 0
+        self.drag_start  = vzero
+        self.drag_starti = vzero
 
         self.connections: Dict[Hatch, Dict[Hatch, Connection]] = {}
 
-        self.to_move: List[NodeFrame] = []
-        self.to_move_left: List[Connection] = []
-        self.to_move_right: List[Connection] = []
+        # self.to_move: List[NodeFrame] = []
+        # self.to_move_left: List[Connection] = []
+        # self.to_move_right: List[Connection] = []
 
         self.selection_rectangle = 0
 
@@ -274,18 +285,22 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         # TODO low: report total failure
         node.propagate_flow()
 
+        eut = 0
         for step in self.nodes:
             if isinstance(step, StepFrame):
                 if step.model is None:
                     raise RuntimeError("Impossible")
                 else:
-                    step.rate.set(step.model.rate)
+                    step.set_rate(step.model.rate)
+                    eut += step.eut
             if isinstance(step, BufferFrame):
                 if step.model is None:
                     raise RuntimeError("Impossible")
                 else:
                     step.display_flow()
-        
+
+        amps, tier = powerTier(eut)
+        print(f"Power usage: {eut:.1f} ({amps:.1f} {TIERS[tier]})")
         for item, flow in Buffer.global_flow.items():
             print(f"{self.globalstate.item_name(item)}: {flow}")
         print()
@@ -340,20 +355,25 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         
         self.master.destroy()
 
-    def gesture(self, x: int, y: int, xint: int, yint: int, mod: Gesture, source: Union["NodeCanvas", "NodeFrame", "Hatch"]):
+    def gesture(self, pos: Vec2, posi: Vec2, mod: Gesture, source: Union["NodeCanvas", "NodeFrame", "Hatch"]):
         if mod == Gesture.PRESS:
-            self.drag_start = (x, y)
+            self.drag_start = pos
 
             source.focus_set()
-            if isinstance(source, NodeFrame) and source not in self.selection:
+            if isinstance(source, NodeFrame):
+                if source not in self.selection:
+                    self.deselect_all()
+                    self.select(source)
+            else:
                 self.deselect_all()
-                self.select(source)
 
-            self.drag_init(source != self)
+
+            # self.drag_init(source != self)
         elif mod == Gesture.PRESS | Gesture.SHIFT:
-            self.drag_starti = (xint, yint)
-            self.drag_start = (x, y)
+            self.drag_starti = posi
+            self.drag_start  = pos
             if source == self:
+                xint, yint = posi
                 self.selection_rectangle = self.create_rectangle(xint, yint, xint, yint, width=1, outline="#0000FF")
         elif mod == Gesture.CLICK:
             if source == self:
@@ -370,12 +390,13 @@ class NodeCanvas(BetterWidget, tk.Canvas):
                     self.toggle_connect(self.hatch, source)
                     self.hatch = None
         elif mod == Gesture.CLICK | Gesture.RIGHT:
+            x, y = pos
             if isinstance(source, StepFrame):
                 self.node_menu.tk_popup(x, y, 0)
                 self.node_menu.node = source
             else:
                 self.canv_menu.tk_popup(x, y, 0)
-                self.canv_menu.coords = Vec2(xint, yint)
+                self.canv_menu.coords = posi
         elif mod == Gesture.CLICK | Gesture.SHIFT:
             self.delete(self.selection_rectangle)
             self.selection_rectangle = 0
@@ -389,17 +410,26 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         elif mod == Gesture.HOLD | Gesture.SHIFT:
             self.delete(self.selection_rectangle)
         elif mod == Gesture.DRAG:
-            self.drag(x, y)
+            self.drag(pos)
         elif mod == Gesture.DRAG | Gesture.SHIFT:
             if self.selection_rectangle:
-                self.change_region_selection(xint, yint)
+                self.change_region_selection(posi)
         elif mod & (~ Gesture.SHIFT) == Gesture.DRAG_END:
             self.drag_finish()
 
             if self.selection_rectangle:
-                self.select_region(xint, yint)
+                self.select_region(posi)
                 self.delete(self.selection_rectangle)
                 self.selection_rectangle = 0
+        elif mod & Gesture.SCROLL:
+            delta = pos.x / 120 / 10
+
+            delta *= 3
+
+
+            self.globalstate.scale = max(0.01, self.globalstate.scale * (1 + delta))
+            self.update_positions()
+            self.update_scales()
 
         if not isinstance(source, Hatch):
             self.hatch = None
@@ -407,67 +437,68 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         # self.configure(background="#DDDDDD")
         # less trails, but stupid
         
-    def drag_init(self, on_selection):
-        self.to_move = self.selection if on_selection else self.nodes
+    # def drag_init(self, on_selection):
+    #     self.to_move = self.selection
         
-        to_move_left = set()
-        to_move_right = set()
+    #     to_move_left = set()
+    #     to_move_right = set()
 
-        for child in self.to_move:
-            for hatch in child.input_hatches.hatches:
-                for conn in hatch.connections:
-                    to_move_right.add(self.connections[hatch][conn])
+    #     for child in self.to_move:
+    #         for hatch in child.input_hatches.hatches:
+    #             for conn in hatch.connections:
+    #                 to_move_right.add(self.connections[hatch][conn])
 
-            for hatch in child.output_hatches.hatches:
-                for conn in hatch.connections:
-                    to_move_left.add(self.connections[hatch][conn])
+    #         for hatch in child.output_hatches.hatches:
+    #             for conn in hatch.connections:
+    #                 to_move_left.add(self.connections[hatch][conn])
 
-        self.to_move_left = list(to_move_left)
-        self.to_move_right = list(to_move_right)
+    #     self.to_move_left = list(to_move_left)
+    #     self.to_move_right = list(to_move_right)
 
-    def drag(self, x, y):
-        dx = x - self.drag_start[0]
-        dy = y - self.drag_start[1]
+    def update_positions(self):        
+        for child in self.nodes:
+            child.update_position()
+
+    def update_scales(self):
+        for child in self.nodes:
+            child.update_scale()
+
+    def drag(self, pos):
+        dp = (pos - self.drag_start) / self.globalstate.scale
+        
+        self.drag_start = pos
+
     
-        for child in self.to_move:
-            child.place(x=child.drag_start[0] + dx, y=child.drag_start[1] + dy)
-
-        for conn in self.to_move_left:
-            x1, y1, x2, y2 = conn.drag_start
-
-            if conn in self.to_move_right:
-                self.coords(conn.line, x1 + dx, y1 + dy, x2 + dx, y2 + dy)
-            else:
-                self.coords(conn.line, x1 + dx, y1 + dy, x2, y2)
-
-        for conn in self.to_move_right:
-            x1, y1, x2, y2 = conn.drag_start
-
-            if conn not in self.to_move_left:
-                self.coords(conn.line, x1, y1, x2 + dx, y2 + dy)
+        if self.selection:
+            for child in self.selection:
+                child.move(dp)
+        else:
+            self.globalstate.center -= dp
+            self.update_positions()
 
     def drag_finish(self):
-        if not self.to_move:
-            # just get all connections loaded
-            self.drag_init(False)
+        # if not self.to_move:
+        #     # just get all connections loaded
+        #     self.drag_init(False)
 
         self.update_idletasks()
 
-        for child in self.to_move:
-            child.drag_start = (child.winfo_x(), child.winfo_y())
+        # for child in self.to_move:
+        #     child.drag_start = (child.winfo_x(), child.winfo_y())
 
-            for conn in self.to_move_left:
-                conn.drag_start = self.coords(conn.line)
+        #     for conn in self.to_move_left:
+        #         conn.drag_start = self.coords(conn.line)
 
-            for conn in self.to_move_right:
-                conn.drag_start = self.coords(conn.line)
+        #     for conn in self.to_move_right:
+        #         conn.drag_start = self.coords(conn.line)
 
-        self.to_move = []
-        self.to_move_left = []
-        self.to_move_right = []
+        # self.to_move = []
+        # self.to_move_left = []
+        # self.to_move_right = []
 
-    def select_region(self, x1, y1):
+    def select_region(self, pos):
         x0, y0 = self.drag_starti
+        x1, y1 = pos
 
         x0, x1 = min(x0, x1), max(x0, x1)
         y0, y1 = min(y0, y1), max(y0, y1)
@@ -482,8 +513,9 @@ class NodeCanvas(BetterWidget, tk.Canvas):
             if x0 < x < x1 and y0 < y < y1 and child not in self.selection:
                 self.select(child)    
 
-    def change_region_selection(self, xi, yi):
-        self.coords(self.selection_rectangle, *self.drag_starti, xi, yi)
+    def change_region_selection(self, posi):
+        xint, yint = posi
+        self.coords(self.selection_rectangle, *self.drag_starti, xint, yint)
 
     def deselect_all(self):
         for child in self.selection:
@@ -508,7 +540,9 @@ class NodeCanvas(BetterWidget, tk.Canvas):
             child.focus_set()
 
     def new_node(self, pos: Vec2):
-        node = StepFrame(master=self, globalstate=self.globalstate, pos=pos)
+        pos_ = pos + self.globalstate.center - self.globalstate.screencenter
+
+        node = StepFrame(master=self, globalstate=self.globalstate, pos=pos_)
         self.nodes.append(node)
         node.drag_init()
 
@@ -534,7 +568,9 @@ class NodeCanvas(BetterWidget, tk.Canvas):
             self.delete_node(child)
 
     def new_buffer(self, pos: Vec2):
-        node = BufferFrame(master=self, globalstate=self.globalstate, pos=pos)
+        pos_ = pos + self.globalstate.center - self.globalstate.screencenter
+
+        node = BufferFrame(master=self, globalstate=self.globalstate, pos=pos_)
         self.nodes.append(node)
         node.drag_init()
 
@@ -558,10 +594,24 @@ class NodeCanvas(BetterWidget, tk.Canvas):
             dx = self.winfo_rootx()
             dy = self.winfo_rootx()
 
-            conn = Connection(self, self.create_line(x1 - dx, y1 - dy, x2 - dx, y2 - dy, fill="#00FF00", width=3))
+            conn = Connection(self, self.create_line(x1 - dx, y1 - dy, x2 - dx, y2 - dy, fill="#00FF00", width=3), a, b)
 
             self.connections.setdefault(a, {})[b] = conn
             self.connections.setdefault(b, {})[a] = conn
+    
+    def update_connection(self, a: "Hatch", b: "Hatch"):
+        connection = self.connections[a][b] 
+
+        x1, y1 = a.relative_position(self)
+        x2, y2 = b.relative_position(self)
+
+        x1, y1 = x1 + a.winfo_width() // 2, y1 + a.winfo_height()
+        x2, y2 = x2 + b.winfo_width() // 2, y2 + b.winfo_height()
+
+        dx = self.winfo_rootx()
+        dy = self.winfo_rootx()
+
+        self.coords(connection.line, x1 - dx, y1 - dy, x2 - dx, y2 - dy)
 
     def disconnect(self, a: "Hatch", b: "Hatch"):
         if self.connections.get(a, {}).get(b) is not None:
@@ -602,7 +652,13 @@ class Position(BetterWidget):
         else:
             raise RuntimeError(f"{relative_to} is not above {self}")
 
-    def reposition(self):
+    def move(self, dp):
+        self.pos += dp
+        self.update_position()
+
+
+
+    def update_position(self):
         if self.force:
             p = (self.pos - self.globalstate.center) * self.globalstate.scale + self.globalstate.screencenter
             x, y = p
@@ -622,7 +678,8 @@ class Position(BetterWidget):
 
 
 class Hatches(Position, BetterFrame, ABC):
-    def __init__(self, globalstate: State, master: NodeCanvas, inputs=None, outputs=None, **kwargs):
+    def __init__(self, globalstate: State, master: NodeCanvas
+                , inputs: Optional["HatchBar"]=None, outputs: Optional["HatchBar"]=None, **kwargs):
         super(Hatches, self).__init__(globalstate=globalstate, master=master, **kwargs)
         self.master: NodeCanvas
 
@@ -634,6 +691,10 @@ class Hatches(Position, BetterFrame, ABC):
     @abstractmethod
     def set_background(self, colour):
         ...
+
+    def update_scale(self):
+        self.input_hatches.update_scale()
+        self.output_hatches.update_scale()
 
     def update_connected_colour(self):
         good = True
@@ -664,6 +725,32 @@ class Hatches(Position, BetterFrame, ABC):
         self.input_hatches.decode(*inputs)
         self.output_hatches.decode(*outputs)
 
+    def update_position(self):
+        super(Hatches, self).update_position()
+        self.input_hatches.update_hatches()
+        self.output_hatches.update_hatches()
+        
+
+    def move(self, dp):
+        super(Hatches, self).move(dp)
+        self.input_hatches.update_hatches()
+        self.output_hatches.update_hatches()
+
+        #     for c in h.connections:
+
+        #     x1, y1, x2, y2 = conn.drag_start
+
+        #     if conn in self.to_move_right:
+        #         self.coords(conn.line, x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+        #     else:
+        #         self.coords(conn.line, x1 + dx, y1 + dy, x2, y2)
+
+        # for conn in self.to_move_right:
+        #     x1, y1, x2, y2 = conn.drag_start
+
+        #     if conn not in self.to_move_left:
+        #         self.coords(conn.line, x1, y1, x2 + dx, y2 + dy)
+
 
 class NodeFrame(Hatches, ABC):
     def __init__(self, master: NodeCanvas, **kwargs):
@@ -681,25 +768,33 @@ class NodeFrame(Hatches, ABC):
 
         self.drag_start: Tuple[int, int] = 0, 0
 
-        self.place(width=200, height=200)
+        self.nwidth = self.nheight = 200
+        self.place(width=self.nwidth, height=self.nheight)
         self.configure(background="#FFFFFF", highlightbackground="#000000", highlightcolor="#0000FF", highlightthickness=1)
     
         self.bind("<Delete>", lambda e: self.master.delete_selection())
 
     # TODO low: disconnect all button
-    @abstractmethod
     def encode(self, hatch_tl):
         return super(NodeFrame, self).encode(hatch_tl)
+    
+    def update_scale(self):
+        super(NodeFrame, self).update_scale()
+
+        s = self.globalstate.scale
+        self.place(width=s * self.nwidth, height=s * self.nheight)
+        # self.input_hatches.update_scale()
+        # self.output_hatches.update_scale()
 
     def decode(self, **d):
         super(NodeFrame, self).decode(**d)
 
     @classmethod
-    def _decode(cls, globalstate, master, **d):
-        if d.get("type", "step") == "step":
+    def _decode(cls, globalstate, master, type, **d):
+        if type == "step":
             x = StepFrame(globalstate=globalstate, master=master)
             x.decode(**d)
-        elif d["type"] == "buffer":
+        elif type == "buffer":
             x = BufferFrame(globalstate=globalstate, master=master)
             x.decode(**d)
         else:
@@ -771,6 +866,19 @@ def ask_multiple_choice_question(master, prompt, options):
         return options[v.get()]
 
 
+TIERS = [ "LV", "MV", "HV", "EV"
+        , "IV", "LuV", "ZPM", "UV"
+        , "UHV", "UEV", "UIV", "UMV"]
+def powerTier(eut):
+
+    m = eut / 32
+    e = min(math.ceil(math.log(max(m, 1), 4)), len(TIERS) - 1)
+
+    m /= 4 ** e
+
+    return (m, e)
+
+
 class StepFrame(NodeFrame):
     def __init__(self, **kwargs):
         super(StepFrame, self).__init__(**kwargs)
@@ -786,21 +894,26 @@ class StepFrame(NodeFrame):
         self.recipe: Optional[Recipe] = None
         self.recipe_id: Optional[int] = None
         self.rate   = tk.DoubleVar()
+        self.eut = 0
 
         invalidate_machine = self.register(self.invalidate_machine)
+        validate_rate = self.register(self.validate_rate)
 
         # TODO high: list valid machines
         self.machinebox = AutocompleteEntry(self.settings, completevalues=list(self.globalstate.recipes_by_machine.keys()), textvariable=self.machine, validatecommand=(invalidate_machine,))
         self.recipebox  = tk.Label(self.settings, textvariable=self.recipe_name)
         self.recipebox.configure(background="white", borderwidth=2, relief="groove")
-        self.ratebox    = tk.Entry(self.settings, textvariable=self.rate)
+        self.ratebox    = tk.Entry(self.settings, textvariable=self.rate, validatecommand=(validate_rate,))
+        self.powerlabel = tk.Label(self.settings)
 
         self.machinebox.grid(column=0, row=0)
         self.recipebox.grid(column=0, row=1)
         self.ratebox.grid(column=0, row=2)
+        self.powerlabel.grid(column=0, row=3)
         self.settings.grid_rowconfigure(0, weight=1)
         self.settings.grid_rowconfigure(1, weight=1)
         self.settings.grid_rowconfigure(2, weight=1)
+        self.settings.grid_rowconfigure(3, weight=1)
         self.settings.grid_columnconfigure(0, weight=1)
         
         self.bind("<Control-r>", lambda _: self.refine())
@@ -810,6 +923,12 @@ class StepFrame(NodeFrame):
             self.settings.bind(e, lambda e: self.master.gesture_manager.on_event(e, self))
         
         self.update_connected_colour()
+
+    def update_scale(self):
+        super(StepFrame, self).update_scale()
+        self.machinebox.configure(font=("Segoe UI",  int(1 + 8 * self.globalstate.scale)))
+        self.recipebox.configure(font=("Segoe UI",  int(1 + 8 * self.globalstate.scale)))
+        self.ratebox.configure(font=("Segoe UI",  int(1 + 8 * self.globalstate.scale)))
 
     def set_background(self, colour):
         self.configure(background=colour)
@@ -857,7 +976,7 @@ class StepFrame(NodeFrame):
         self.output_hatches.remove_all()
 
     def set_recipe(self, recipe: Optional[Recipe]=None, recipe_id=None):
-        if recipe:
+        if recipe is not None:
             self.recipe = recipe
             recipe_id = self.globalstate.recipe_id(self.machine.get(), recipe.raw)
             self.recipe_name.set(str(self.recipe))
@@ -866,7 +985,7 @@ class StepFrame(NodeFrame):
                 self.invalidate_recipe()
 
             self.recipe_id = recipe_id
-        elif recipe_id:
+        elif recipe_id is not None:
             self.recipe = self.globalstate.recipe_by_id(self.machine.get(), recipe_id)
             self.recipe_id = recipe_id
             self.recipe_name.set(str(self.recipe))
@@ -937,16 +1056,39 @@ class StepFrame(NodeFrame):
 
         return d
 
-    def decode(self, machine, recipe_id, rate, **d):
+    def decode(self, machine, recipe, rate, **d):
         super(StepFrame, self).decode(**d)
 
         self.machine.set(machine)
-        self.recipe_id = recipe_id
+        self.recipe_id = recipe
 
         if self.recipe_id is not None:
             self.set_recipe(recipe_id=self.recipe_id)
 
+        self.set_rate(rate)
+
+    def validate_rate(self):
+        rate = self.rate.get()
+
+        if self.recipe is not None:
+            self.eut = eut = self.recipe.power * rate
+            amps, tier = powerTier(eut)
+
+            _, minTier = powerTier(self.recipe.power)
+
+            # print(tier, minTier, self.recipe, self.recipe.power)
+
+            if tier < minTier:
+                text = f"{eut:.1f} ({amps:.1f} {TIERS[tier]}, min. {TIERS[minTier]})"
+            else:
+                text = f"{eut:.1f} ({amps:.1f} {TIERS[tier]})"
+
+            self.powerlabel.configure(text=text)
+
+    def set_rate(self, rate):
         self.rate.set(rate)
+        self.validate_rate()
+    
 
     def reconstruct(self):
         if self.recipe is None:
@@ -959,7 +1101,7 @@ class StepFrame(NodeFrame):
 
 class BufferFrame(NodeFrame):
     def __init__(self, **kwargs):
-        super(NodeFrame, self).__init__(**kwargs)
+        super(BufferFrame, self).__init__(**kwargs)
 
         self.model: Optional[Buffer]
         self.label = tk.Label(self, text="AE")
@@ -970,6 +1112,10 @@ class BufferFrame(NodeFrame):
         
         for e in MOUSE_EVENTS:
             self.label.bind(e, lambda e: self.master.gesture_manager.on_event(e, self))
+
+    def update_scale(self):
+        super(BufferFrame, self).update_scale()
+        self.label.configure(font=("Segoe UI", int(1 + 8 * self.globalstate.scale)))
 
     def display_flow(self):
         if self.model is None:
@@ -1007,6 +1153,12 @@ class HatchBar(Position, BetterFrame):
 
         self.space()
 
+    def update_scale(self):
+        self.plus.configure(font=("Segoe UI",  int(1 + 8 * self.globalstate.scale)))
+
+        for h in self.hatches:
+            h.update_scale()
+
     def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
         d = []
         for hatch in self.hatches:
@@ -1040,6 +1192,10 @@ class HatchBar(Position, BetterFrame):
         for hatch in self.hatches:
             hatch.tie(canvas, nodes)
 
+    def update_hatches(self):
+        for hatch in self.hatches:
+            hatch.update_connections()
+
     def add_hatch(self, item_id=None):
         # TODO low: adding hatches should move connections on the canvas
         self.hatches.append(Hatch(master=self, globalstate=self.globalstate, is_input=self.is_input, item_id=item_id))
@@ -1063,11 +1219,15 @@ class HatchBar(Position, BetterFrame):
         for i, x in enumerate(xs):
             x.place(relx=i / n, rely=0, relwidth=1 / n, relheight=1)
 
+        self.update_hatches()
+
 
 class Connection:
-    def __init__(self, canvas: NodeCanvas, line: int):
+    def __init__(self, canvas: NodeCanvas, line: int, start: "Hatch", end: "Hatch"):
         self.line = line
         self.drag_start = canvas.coords(line)
+        self.start = start
+        self.end = end
 
 
 class Hatch(Position, BetterFrame):
@@ -1108,14 +1268,17 @@ class Hatch(Position, BetterFrame):
 
         self.bind("<Delete>", lambda e: self.master.remove_hatch(self))
 
+    def update_scale(self):
+        self.label.configure(font=("Segoe UI",  int(1 + 8 * self.globalstate.scale)))
+
     def remove(self):
         self.disconnect_all()
         self.destroy()
 
     def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
         return { "connections": [hatch_tl[x] for x in self.connections]
-               , "id": self.item_id
-               , "name": self.item_name }
+               , "item_id": self.item_id
+               , "item_name": self.item_name }
 
     def decode(self, connections, item_id, item_name):
         self.d_connections = connections
@@ -1185,6 +1348,10 @@ class Hatch(Position, BetterFrame):
 
         if item_id != self.item_id:
             self.disconnect_all()
+
+    def update_connections(self):
+        for c in self.connections:
+            self.globalstate.master.update_connection(self, c)
 
 
 def main():
