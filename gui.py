@@ -285,7 +285,9 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         # TODO low: report total failure
         node.propagate_flow()
 
+        summary = {}
         eut = 0
+        surge_eut = 0
         for step in self.nodes:
             if isinstance(step, StepFrame):
                 if step.model is None:
@@ -293,6 +295,9 @@ class NodeCanvas(BetterWidget, tk.Canvas):
                 else:
                     step.set_rate(step.model.rate)
                     eut += step.eut
+                    surge_eut += step.surge_eut
+                    machine = step.machine.get()
+                    summary[machine] = 1 + summary.get(machine, 0)
             if isinstance(step, BufferFrame):
                 if step.model is None:
                     raise RuntimeError("Impossible")
@@ -300,9 +305,21 @@ class NodeCanvas(BetterWidget, tk.Canvas):
                     step.display_flow()
 
         amps, tier = powerTier(eut)
+        surge_amps, surge_tier = powerTier(surge_eut)
         print(f"Power usage: {eut:.1f} ({amps:.1f} {TIERS[tier]})")
-        for item, flow in Buffer.global_flow.items():
-            print(f"{self.globalstate.item_name(item)}: {flow}")
+        print(f"Surge usage: {surge_eut:.1f} ({surge_amps:.1f} {TIERS[surge_tier]})")
+
+        flows = [(flow, item) for item, flow in Buffer.global_flow.items()]
+        flows.sort()
+        
+        for flow, item in flows:
+            if abs(flow) < 1e-10:
+                print(f"{self.globalstate.item_name(item)}: Neutral?")
+            else:
+                print(f"{self.globalstate.item_name(item)}: {flow}")
+        print("Summary:")
+        for machine, num in summary.items():
+            print(f"{num:>3}x {machine}")
         print()
 
     def reconstruct(self):
@@ -564,8 +581,8 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         child.destroy()
 
     def delete_selection(self):
-        for child in self.selection.copy():
-            self.delete_node(child)
+        while self.selection:
+            self.selection[0].delete()
 
     def new_buffer(self, pos: Vec2):
         pos_ = pos + self.globalstate.center - self.globalstate.screencenter
@@ -577,6 +594,12 @@ class NodeCanvas(BetterWidget, tk.Canvas):
         return node
 
     def connect(self, a: "Hatch", b: "Hatch"):
+        if a == b:
+            return
+
+        if a.is_input == b.is_input:
+            return
+        
         if self.connections.get(a, {}).get(b) is None:
             if a.is_input:
                 a, b = b, a
@@ -623,11 +646,10 @@ class NodeCanvas(BetterWidget, tk.Canvas):
             b._disconnect(a)
 
     def toggle_connect(self, a: "Hatch", b: "Hatch"):
-        if a.is_input != b.is_input:
-            if self.connections.get(a, {}).get(b) is None:
-                self.connect(a, b)
-            else:
-                self.disconnect(a, b)
+        if self.connections.get(a, {}).get(b) is None:
+            self.connect(a, b)
+        else:
+            self.disconnect(a, b)
 
 vzero = Vec2(0, 0)
 
@@ -894,7 +916,7 @@ class StepFrame(NodeFrame):
         self.recipe: Optional[Recipe] = None
         self.recipe_id: Optional[int] = None
         self.rate   = tk.DoubleVar()
-        self.eut = 0
+        self.eut = self.surge_eut = 0
 
         invalidate_machine = self.register(self.invalidate_machine)
         validate_rate = self.register(self.validate_rate)
@@ -917,6 +939,7 @@ class StepFrame(NodeFrame):
         self.settings.grid_columnconfigure(0, weight=1)
         
         self.bind("<Control-r>", lambda _: self.refine())
+        self.bind("<Control-a>", lambda _: self.auto())
         self.recipebox.bind("<Button-1>", lambda _: self.select_recipe())
 
         for e in MOUSE_EVENTS:
@@ -934,17 +957,39 @@ class StepFrame(NodeFrame):
         self.configure(background=colour)
         self.settings.configure(background=colour)
 
+    def delete(self):
+        self.invalidate_machine()
+        super(StepFrame, self).delete()
+
+    def auto(self):
+        if self.recipe is not None:
+            for hatch1 in self.input_hatches.hatches:
+                if not hatch1.connections:
+                    for node in self.master.nodes:
+                        for hatch2 in node.output_hatches.hatches:
+                            if hatch1.item_id == hatch2.item_id:
+                                self.globalstate.master.connect(hatch1, hatch2)
+
+            for hatch1 in self.output_hatches.hatches:
+                if not hatch1.connections:
+                    for node in self.master.nodes:
+                        for hatch2 in node.input_hatches.hatches:
+                            if hatch1.item_id == hatch2.item_id:
+                                self.globalstate.master.connect(hatch1, hatch2)
+
     def refine(self):
         p = self.position()
 
         if self.recipe is not None:
             for n, hatch in enumerate(self.input_hatches.hatches):
                 if not hatch.connections:
-                    self.master.new_node(p + Vec2(-100 + 50 *  n, -300))
+                    other = self.master.new_node(p + Vec2(-100 + 50 *  n, -300))
+                    self.globalstate.master.connect(hatch, other.output_hatches.add_hatch())
 
             for n, hatch in enumerate(self.output_hatches.hatches):
                 if not hatch.connections:
-                    self.master.new_node(p + Vec2(-100 + 50 *  n, 300))
+                    other = self.master.new_node(p + Vec2(-100 + 50 *  n, 300))
+                    self.globalstate.master.connect(hatch, other.input_hatches.add_hatch())
 
     def invalidate_machine(self):
         # print("Invalidate!")
@@ -1076,12 +1121,15 @@ class StepFrame(NodeFrame):
 
             _, minTier = powerTier(self.recipe.power)
 
+            surgeTier = max(tier, minTier)
+            self.surge_eut = 32 * (4 ** surgeTier)
+
             # print(tier, minTier, self.recipe, self.recipe.power)
 
-            if tier < minTier:
-                text = f"{eut:.1f} ({amps:.1f} {TIERS[tier]}, min. {TIERS[minTier]})"
-            else:
-                text = f"{eut:.1f} ({amps:.1f} {TIERS[tier]})"
+            #if tier < minTier:
+            text = f"{eut:.1f} ({amps:.1f} {TIERS[tier]}, min. {TIERS[minTier]})"
+            #else:
+            #    text = f"{eut:.1f} ({amps:.1f} {TIERS[tier]})"
 
             self.powerlabel.configure(text=text)
 
@@ -1185,8 +1233,8 @@ class HatchBar(Position, BetterFrame):
             hatch.disconnect_all()
 
     def remove_all(self):
-        for hatch in list(self.hatches):
-            self.remove_hatch(hatch)
+        while self.hatches:
+            self.remove_hatch(self.hatches[0])
 
     def tie(self, canvas: "NodeCanvas", nodes: List["NodeFrame"]):
         for hatch in self.hatches:
@@ -1198,9 +1246,12 @@ class HatchBar(Position, BetterFrame):
 
     def add_hatch(self, item_id=None):
         # TODO low: adding hatches should move connections on the canvas
-        self.hatches.append(Hatch(master=self, globalstate=self.globalstate, is_input=self.is_input, item_id=item_id))
+        x = Hatch(master=self, globalstate=self.globalstate, is_input=self.is_input, item_id=item_id)
+        self.hatches.append(x)
         self.update_colour()
         self.space()
+
+        return x
 
     def insert_hatch(self, i, hatch):
         self.hatches.insert(i, hatch)
@@ -1276,7 +1327,7 @@ class Hatch(Position, BetterFrame):
         self.destroy()
 
     def encode(self, hatch_tl: Dict["Hatch", Tuple[int, bool, int]]):
-        return { "connections": [hatch_tl[x] for x in self.connections]
+        return { "connections": [hatch_tl[x] for x in self.connections if x in hatch_tl] # start screaming if it isn't
                , "item_id": self.item_id
                , "item_name": self.item_name }
 
@@ -1330,8 +1381,8 @@ class Hatch(Position, BetterFrame):
                 self.master.update_colour()
 
     def disconnect_all(self):
-        for conn in self.connections:
-            self.master.disconnect(self, conn)
+        while self.connections:
+            self.master.disconnect(self, self.connections[0])
 
     def item_menu(self):
         item_name = tkinter.simpledialog.askstring("Item name?", "Item name?", initialvalue=self.item_name)
